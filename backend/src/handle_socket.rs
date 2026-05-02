@@ -1,20 +1,21 @@
+use std::sync::Arc;
+
 use crate::{
-    auth::{validate_access_and_id, Role},
-    db::{
-        self, CancelOrderStatus, CreateAccountStatus, CreateMarketStatus, CreateOrderStatus,
-        EnsureUserCreatedStatus, MakeTransferStatus, SettleMarketStatus, DB,
-    },
+    auth::{validate_access_and_id_or_test, Role},
+    db::{self, EnsureUserCreatedSuccess, DB},
     websocket_api::{
         client_message::Message as CM,
-        order_created::OrderFill,
         request_failed::{ErrorDetails, RequestDetails},
         server_message::Message as SM,
-        Account, Accounts, ActingAs, Authenticated, ClientMessage, GetFullOrderHistory,
-        GetFullTradeHistory, Market, MarketSettled, Order, OrderCreated, Orders, OrdersCancelled,
-        OwnershipGiven, Portfolio, Portfolios, Redeem, Redeemed, RequestFailed, ServerMessage,
-        Side, Size, Trade, Trades, Transaction, Transactions, Transfer, Transfers,
+        Account, Accounts, ActingAs, Auction, AuctionDeleted, Authenticated, ClientMessage,
+        GetFullOrderHistory, GetFullTradeHistory, Market, MarketGroup, MarketGroups,
+        MarketStatusChange, MarketStatusChanges, MarketType, MarketTypeDeleted, MarketTypes,
+        OptionContracts, Order, Orders, OwnerCreditRedistributed, OwnershipGiven,
+        OwnershipRevoked, Portfolio, Portfolios, RedeemCodeClaimed, RequestFailed, ServerMessage,
+        SetSudo, SettleAuction, SudoStatus, Trade, Trades, Transfer, Transfers, Universe,
+        Universes,
     },
-    AppState, HIDE_USER_IDS,
+    AppState, CohortState,
 };
 use anyhow::{anyhow, bail};
 use async_stream::stream;
@@ -26,59 +27,113 @@ use rust_decimal_macros::dec;
 use tokio::sync::broadcast::error::RecvError;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
-pub async fn handle_socket(socket: WebSocket, app_state: AppState) {
-    if let Err(e) = handle_socket_fallible(socket, app_state).await {
+pub async fn handle_socket(socket: WebSocket, app_state: AppState, cohort: Arc<CohortState>) {
+    if let Err(e) = handle_socket_fallible(socket, app_state, cohort).await {
         tracing::error!("Error handling socket: {e}");
     } else {
         tracing::info!("Client disconnected");
     }
 }
 
-#[allow(clippy::too_many_lines)]
-async fn handle_socket_fallible(mut socket: WebSocket, app_state: AppState) -> anyhow::Result<()> {
+#[allow(clippy::too_many_lines, unused_assignments)]
+async fn handle_socket_fallible(
+    mut socket: WebSocket,
+    app_state: AppState,
+    cohort: Arc<CohortState>,
+) -> anyhow::Result<()> {
+    let is_read_only = &cohort.is_read_only;
     let AuthenticatedClient {
         id: mut user_id,
         is_admin,
         act_as,
         mut owned_accounts,
-    } = authenticate(&app_state, &mut socket).await?;
+        is_cohort_member,
+    } = authenticate(&app_state, &cohort, &mut socket).await?;
 
+    let admin_id = is_admin.then_some(user_id);
     let mut acting_as = act_as.unwrap_or(user_id);
-    let mut subscription_receivers = app_state.subscriptions.subscribe_all(&owned_accounts);
-    send_initial_private_data(&app_state.db, &owned_accounts, &mut socket, false).await?;
+    let mut sudo_enabled = false;
+    let db = &cohort.db;
+
+    // Mirror the runtime CM::ActAs admin_as_user branch (handle_socket.rs ~222):
+    // when an admin authenticates with `act_as` set to a non-owned account, treat
+    // them as the acted-as user for subscription purposes so initial private data
+    // (portfolios, transfers, tradedMarketIds) gets loaded for that account.
+    // Without this, downstream pages that depend on tradedMarketIds (e.g. the
+    // performance page) miss markets the acted-as account has traded in.
+    if let Some(act_as_id) = act_as {
+        if act_as_id != user_id && !owned_accounts.contains(&act_as_id) && is_admin {
+            user_id = act_as_id;
+            owned_accounts = db.get_owned_accounts(user_id).await?;
+        }
+    }
+
+    let mut subscription_receivers = cohort.subscriptions.subscribe_all(&owned_accounts);
+    let mut current_universe_id = db.get_account_universe_id(acting_as).await?.unwrap_or(0);
+    send_initial_private_data(db, &owned_accounts, &mut socket, false).await?;
 
     macro_rules! update_owned_accounts {
         () => {
-            let new_owned_accounts = app_state.db.get_owned_accounts(user_id).await?;
+            let new_owned_accounts = db.get_owned_accounts(user_id).await?;
             let added_owned_accounts: Vec<_> = new_owned_accounts
-                .into_iter()
+                .iter()
                 .filter(|account_id| !owned_accounts.contains(account_id))
+                .map(|account_id| *account_id)
                 .collect();
             for &account_id in &added_owned_accounts {
                 owned_accounts.push(account_id);
-                app_state
+                cohort
                     .subscriptions
                     .add_owned_subscription(&mut subscription_receivers, account_id);
             }
-            send_initial_private_data(&app_state.db, &added_owned_accounts, &mut socket, true)
-                .await?;
+
+            let removed_owned_accounts: Vec<_> = owned_accounts
+                .iter()
+                .filter(|account_id| !new_owned_accounts.contains(account_id))
+                .map(|account_id| *account_id)
+                .collect();
+            owned_accounts.retain(|account_id| !removed_owned_accounts.contains(account_id));
+            for &account_id in &removed_owned_accounts {
+                cohort
+                    .subscriptions
+                    .remove_owned_subscription(&mut subscription_receivers, account_id);
+            }
+            if removed_owned_accounts.contains(&acting_as) {
+                acting_as = user_id;
+                current_universe_id = db.get_account_universe_id(user_id).await?.unwrap_or(0);
+                let acting_as_msg = encode_server_message(
+                    String::new(),
+                    SM::ActingAs(ActingAs {
+                        account_id: user_id,
+                        universe_id: current_universe_id,
+                        user_id,
+                    }),
+                );
+                socket.send(acting_as_msg).await?;
+            }
+            send_initial_private_data(db, &owned_accounts, &mut socket, false).await?;
+            // if are_new_ownership is enabled, the client will not realize that they have been revoked ownership
+            // send_initial_private_data(db, &added_owned_accounts, &mut socket, true).await?;
             if !is_admin {
-                send_initial_public_data(&app_state.db, is_admin, &owned_accounts, &mut socket)
-                    .await?;
+                send_initial_public_data(db, is_admin, &owned_accounts, current_universe_id, cohort.auctions_enabled.load(std::sync::atomic::Ordering::Relaxed), &mut socket).await?;
             }
         };
     }
     update_owned_accounts!();
     if is_admin {
         // Since we're not sending it in update_owned_accounts
-        send_initial_public_data(&app_state.db, is_admin, &owned_accounts, &mut socket).await?;
+        // Pass false because sudo_enabled starts as false - admins must enable sudo to see hidden data
+        send_initial_public_data(db, false, &owned_accounts, current_universe_id, cohort.auctions_enabled.load(std::sync::atomic::Ordering::Relaxed), &mut socket)
+            .await?;
     }
 
     // Important that this is last - it doubles as letting the client know we're done sending initial data
-    let acting_as_msg = server_message(
+    let acting_as_msg = encode_server_message(
         String::new(),
         SM::ActingAs(ActingAs {
             account_id: acting_as,
+            universe_id: current_universe_id,
+            user_id,
         }),
     );
     socket.send(acting_as_msg).await?;
@@ -89,19 +144,23 @@ async fn handle_socket_fallible(mut socket: WebSocket, app_state: AppState) -> a
             msg = subscription_receivers.public.recv() => {
                 match msg {
                     Ok(mut msg) => {
-                        if !is_admin {
-                            conditionally_hide_user_ids(&owned_accounts, &mut msg);
+                        if !is_admin || !sudo_enabled {
+                            // Filter out messages about markets the user can't see
+                            if should_filter_for_visibility(db, &owned_accounts, &msg).await? {
+                                continue;
+                            }
+                            conditionally_hide_user_ids(db, &owned_accounts, &mut msg).await?;
                         }
                         socket.send(msg.encode_to_vec().into()).await?;
                     },
                     Err(RecvError::Lagged(n)) => {
                         tracing::warn!("Lagged {n}");
-                        send_initial_public_data(&app_state.db, is_admin, &owned_accounts, &mut socket).await?;
+                        send_initial_public_data(db, is_admin && sudo_enabled, &owned_accounts, current_universe_id, cohort.auctions_enabled.load(std::sync::atomic::Ordering::Relaxed), &mut socket).await?;
                     }
                     Err(RecvError::Closed) => {
                         bail!("Market sender closed");
                     }
-                };
+                }
             }
             msg = socket.recv() => {
                 let Some(msg) = msg else {
@@ -109,36 +168,100 @@ async fn handle_socket_fallible(mut socket: WebSocket, app_state: AppState) -> a
                     break Ok(())
                 };
                 let msg = msg?;
-                if let ws::Message::Close(_) = msg {
-                    break Ok(());
+                match msg {
+                    ws::Message::Close(close_frame) => {
+                        // Send close frame back to complete the WebSocket close handshake
+                        let _ = socket.send(ws::Message::Close(close_frame)).await;
+                        break Ok(());
+                    }
+                    ws::Message::Ping(payload) => {
+                        // Respond to ping with pong (tungstenite auto-response may not work reliably)
+                        socket.send(ws::Message::Pong(payload)).await?;
+                        continue;
+                    }
+                    ws::Message::Pong(_) => {
+                        // Pong received, nothing to do
+                        continue;
+                    }
+                    _ => {}
                 }
-                if let Some(act_as) = handle_client_message(
+                // admin_id is only passed as Some when sudo is enabled
+                let effective_admin_id = if sudo_enabled { admin_id } else { None };
+                if let Some(result) = handle_client_message(
                     &mut socket,
                     &app_state,
-                    is_admin,
+                    &cohort,
+                    effective_admin_id,
                     user_id,
-                    &mut acting_as,
+                    acting_as,
                     &owned_accounts,
+                    is_read_only,
+                    is_cohort_member,
                     msg,
                 )
                 .await? {
-                    if act_as.admin_as_user {
-                        user_id = act_as.account_id;
-                        owned_accounts = app_state.db.get_owned_accounts(user_id).await?;
-                        subscription_receivers = app_state.subscriptions.subscribe_all(&owned_accounts);
-                        // TODO: somehow notify the client to get rid of existing portfolios
-                        send_initial_private_data(&app_state.db, &owned_accounts, &mut socket, false).await?;
-                        update_owned_accounts!();
+                if let HandleResult::SudoChange { request_id, enabled } = result {
+                    if enabled && !is_admin {
+                        let resp = request_failed(request_id, "SetSudo", "Only admins can enable sudo");
+                        socket.send(resp).await?;
+                        continue;
                     }
-                    acting_as = act_as.account_id;
-                    let acting_as_msg = server_message(
-                        act_as.request_id,
-                        SM::ActingAs(ActingAs {
-                            account_id: act_as.account_id,
-                        }),
+                    sudo_enabled = enabled;
+                    let sudo_status_msg = encode_server_message(
+                        request_id,
+                        SM::SudoStatus(SudoStatus { enabled }),
                     );
-                    socket.send(acting_as_msg).await?;
+                    socket.send(sudo_status_msg).await?;
+                    // Resend public data when sudo changes - unhidden when enabled, hidden when disabled
+                    send_initial_public_data(db, enabled, &owned_accounts, current_universe_id, cohort.auctions_enabled.load(std::sync::atomic::Ordering::Relaxed), &mut socket).await?;
+                    continue;
+                }
+                if let HandleResult::AdminRequired { request_id, msg_type } = result {
+                    let message = if is_admin {
+                        "Sudo required"
+                    } else {
+                        match msg_type {
+                            "RevokeOwnership" => "Only admins can revoke ownership",
+                            "ActAs" => "Not owner of account",
+                            _ => "Admin access required",
+                        }
+                    };
+                    let resp = request_failed(request_id, msg_type, message);
+                    socket.send(resp).await?;
+                    continue;
+                }
+                let HandleResult::ActAs(act_as) = result else {
+                    continue;
                 };
+                if act_as.admin_as_user {
+                    user_id = act_as.account_id;
+                    owned_accounts = db.get_owned_accounts(user_id).await?;
+                    subscription_receivers = cohort.subscriptions.subscribe_all(&owned_accounts);
+                    // TODO: somehow notify the client to get rid of existing portfolios
+                    send_initial_private_data(db, &owned_accounts, &mut socket, false).await?;
+                    update_owned_accounts!();
+                }
+                acting_as = act_as.account_id;
+                let act_as_universe_id = db.get_account_universe_id(act_as.account_id).await?.unwrap_or(0);
+
+                // If universe changed, resend markets filtered to new universe
+                let universe_changed = act_as_universe_id != current_universe_id;
+                current_universe_id = act_as_universe_id;
+
+                let acting_as_msg = encode_server_message(
+                    act_as.request_id,
+                    SM::ActingAs(ActingAs {
+                        account_id: act_as.account_id,
+                        universe_id: act_as_universe_id,
+                        user_id,
+                    }),
+                );
+                socket.send(acting_as_msg).await?;
+
+                if universe_changed {
+                    send_initial_public_data(db, is_admin && sudo_enabled, &owned_accounts, current_universe_id, cohort.auctions_enabled.load(std::sync::atomic::Ordering::Relaxed), &mut socket).await?;
+                }
+                }
             }
             msg = subscription_receivers.private.next() => {
                 let Some((target_account_id, msg)) = msg else {
@@ -148,9 +271,9 @@ async fn handle_socket_fallible(mut socket: WebSocket, app_state: AppState) -> a
                     Ok(msg) => socket.send(msg).await?,
                     Err(BroadcastStreamRecvError::Lagged(n)) => {
                         tracing::warn!("Private receiver lagged {n}");
-                        send_initial_private_data(&app_state.db, &[target_account_id], &mut socket, false).await?;
+                        send_initial_private_data(db, &[target_account_id], &mut socket, false).await?;
                     }
-                };
+                }
             }
             msg = subscription_receivers.ownership.next() => {
                 let Some((_, ())) = msg else {
@@ -162,12 +285,11 @@ async fn handle_socket_fallible(mut socket: WebSocket, app_state: AppState) -> a
                 let Some((account_id, ())) = msg else {
                     bail!("Portfolio sender closed or lagged");
                 };
-                let portfolio = app_state
-                    .db
+                let portfolio = db
                     .get_portfolio(account_id)
                     .await?
                     .ok_or_else(|| anyhow!("Account {account_id} not found"))?;
-                let resp = server_message(String::new(), SM::PortfolioUpdated(portfolio.into()));
+                let resp = encode_server_message(String::new(), SM::PortfolioUpdated(portfolio.into()));
                 socket.send(resp).await?;
             }
         }
@@ -183,10 +305,11 @@ async fn send_initial_private_data(
     let mut transfers = Vec::new();
     let mut portfolios = Vec::new();
     for &account_id in accounts {
-        let Some(portfolio) = db.get_portfolio(account_id).await? else {
+        let Some(mut portfolio) = db.get_portfolio(account_id).await? else {
             tracing::warn!("Account {account_id} not found");
             continue;
         };
+        portfolio.traded_market_ids = db.get_traded_market_ids(account_id).await?;
         portfolios.push(Portfolio::from(portfolio));
         transfers.extend(
             db.get_transfers(account_id)
@@ -195,14 +318,14 @@ async fn send_initial_private_data(
                 .map(Transfer::from),
         );
     }
-    let transfers_msg = server_message(
+    let transfers_msg = encode_server_message(
         String::new(),
         SM::Transfers(Transfers {
             transfers: transfers.into_iter().unique_by(|t| t.id).collect(),
         }),
     );
     socket.send(transfers_msg).await?;
-    let portfolios_msg = server_message(
+    let portfolios_msg = encode_server_message(
         String::new(),
         SM::Portfolios(Portfolios {
             portfolios,
@@ -213,10 +336,13 @@ async fn send_initial_private_data(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn send_initial_public_data(
     db: &DB,
     is_admin: bool,
     owned_accounts: &[i64],
+    universe_id: i64,
+    auctions_enabled: bool,
     socket: &mut WebSocket,
 ) -> anyhow::Result<()> {
     let accounts = db
@@ -224,43 +350,101 @@ async fn send_initial_public_data(
         .map(|account| account.map(Account::from))
         .try_collect::<Vec<_>>()
         .await?;
-    let accounts_msg = server_message(String::new(), SM::Accounts(Accounts { accounts }));
+    let accounts_msg = encode_server_message(String::new(), SM::Accounts(Accounts { accounts }));
     socket.send(accounts_msg).await?;
 
-    let transactions = db
-        .get_all_transactions()
-        .map(|transaction_info| transaction_info.map(Transaction::from))
-        .try_collect::<Vec<_>>()
-        .await?;
-    let transactions_msg = server_message(
+    // Send universes
+    let universes = db.get_all_universes().await?;
+    let universes_msg = encode_server_message(
         String::new(),
-        SM::Transactions(Transactions { transactions }),
+        SM::Universes(Universes {
+            universes: universes.into_iter().map(Universe::from).collect(),
+        }),
     );
-    socket.send(transactions_msg).await?;
+    socket.send(universes_msg).await?;
+
+    // Send categories
+    let market_types = db.get_all_market_types().await?;
+    let market_types_msg = encode_server_message(
+        String::new(),
+        SM::MarketTypes(MarketTypes {
+            market_types: market_types.into_iter().map(MarketType::from).collect(),
+        }),
+    );
+    socket.send(market_types_msg).await?;
+
+    // Send groups
+    let market_groups = db.get_all_market_groups().await?;
+    let market_groups_msg = encode_server_message(
+        String::new(),
+        SM::MarketGroups(MarketGroups {
+            market_groups: market_groups.into_iter().map(MarketGroup::from).collect(),
+        }),
+    );
+    socket.send(market_groups_msg).await?;
 
     let markets = db.get_all_markets().await?;
+    // Skip auction load entirely when this cohort has auctions disabled — no
+    // data is sent and the client renders the auction route as unavailable.
+    let auctions = if auctions_enabled {
+        db.get_all_auctions().await?
+    } else {
+        Vec::new()
+    };
+    let last_trades = db.get_last_trades_by_market().await?;
+    let mut status_changes_by_market = db.get_all_status_changes_by_market().await?;
     let mut all_live_orders = db.get_all_live_orders().map(|order| order.map(Order::from));
     let mut next_order = all_live_orders.try_next().await?;
 
     for market in markets {
+        // Filter markets by universe
+        if market.market.universe_id != universe_id {
+            // Consume orders for this skipped market to not corrupt the stream
+            let market_id = market.market.id;
+            let _: Vec<_> = next_stream_chunk(
+                &mut next_order,
+                |order| order.market_id == market_id,
+                &mut all_live_orders,
+            )
+            .try_collect()
+            .await?;
+            continue;
+        }
+
+        // In-memory visibility check: market is visible if it has no restrictions
+        // or if any of the user's owned accounts is in the visible_to list
+        if !is_admin && !market.visible_to.is_empty() {
+            let is_visible = market
+                .visible_to
+                .iter()
+                .any(|&id| owned_accounts.contains(&id));
+            if !is_visible {
+                // Consume orders for this skipped market to not corrupt the stream
+                let market_id = market.market.id;
+                let _: Vec<_> = next_stream_chunk(
+                    &mut next_order,
+                    |order| order.market_id == market_id,
+                    &mut all_live_orders,
+                )
+                .try_collect()
+                .await?;
+                continue;
+            }
+        }
+
         let market = Market::from(market);
         let market_id = market.id;
-        let market_msg = server_message(String::new(), SM::Market(market));
+        let market_msg = encode_server_message(String::new(), SM::Market(market));
         socket.send(market_msg).await?;
 
-        let mut orders = next_stream_chunk(
+        let orders = next_stream_chunk(
             &mut next_order,
             |order| order.market_id == market_id,
             &mut all_live_orders,
         )
         .try_collect::<Vec<_>>()
         .await?;
-        if !is_admin {
-            for order in &mut orders {
-                hide_id(owned_accounts, &mut order.owner_id);
-            }
-        }
-        let orders_msg = server_message(
+        let mut orders_msg = server_message(
             String::new(),
             SM::Orders(Orders {
                 market_id,
@@ -268,72 +452,233 @@ async fn send_initial_public_data(
                 has_full_history: false,
             }),
         );
-        socket.send(orders_msg).await?;
-        // Send empty trades for the case this send_initial_public_data
-        // is called due to a lagged public subscription.
-        let trades_msg = server_message(
+        if !is_admin {
+            conditionally_hide_user_ids(db, owned_accounts, &mut orders_msg).await?;
+        }
+        socket.send(orders_msg.encode_to_vec().into()).await?;
+        // Send last trade for MtM calculation (or empty if no trades yet).
+        // This is needed because full trade history is only fetched on demand.
+        let trades = last_trades
+            .get(&market_id)
+            .map(|trade| vec![Trade::from(trade.clone())])
+            .unwrap_or_default();
+        let mut trades_msg = server_message(
             String::new(),
             SM::Trades(Trades {
                 market_id,
-                trades: vec![],
+                trades,
                 has_full_history: false,
+                redemptions: vec![],
             }),
         );
-        socket.send(trades_msg).await?;
+        if !is_admin {
+            conditionally_hide_user_ids(db, owned_accounts, &mut trades_msg).await?;
+        }
+        socket.send(trades_msg.encode_to_vec().into()).await?;
+
+        let changes = status_changes_by_market
+            .remove(&market_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(MarketStatusChange::from)
+            .collect();
+        let status_changes_msg = encode_server_message(
+            String::new(),
+            SM::MarketStatusChanges(MarketStatusChanges {
+                market_id,
+                changes,
+            }),
+        );
+        socket.send(status_changes_msg).await?;
+    }
+    for auction in auctions {
+        let auction = Auction::from(auction);
+        let auction_msg = encode_server_message(String::new(), SM::Auction(auction));
+        socket.send(auction_msg).await?;
     }
     Ok(())
 }
 
 fn hide_id(owned_accounts: &[i64], id: &mut i64) {
-    if *HIDE_USER_IDS && !owned_accounts.contains(id) {
+    if !owned_accounts.contains(id) {
         *id = 0;
     }
 }
 
-fn conditionally_hide_user_ids(owned_accounts: &[i64], msg: &mut ServerMessage) {
-    if let ServerMessage {
-        message: Some(SM::OrderCreated(order_created)),
-        ..
-    } = msg
-    {
-        hide_id(owned_accounts, &mut order_created.account_id);
-        if let Some(order) = order_created.order.as_mut() {
-            hide_id(owned_accounts, &mut order.owner_id);
+/// If the authenticated client is the configured scenarios M2M, override its
+/// display name to "Arbor Pixie" so it links to the existing Arbor Pixie
+/// account row in each cohort. The matching M2M `client_id` is read from the
+/// `ARBOR_PIXIE_M2M_CLIENT_ID` env var; when unset, this is a no-op.
+fn apply_arbor_pixie_m2m_alias(client: &mut crate::auth::ValidatedClient) {
+    apply_arbor_pixie_m2m_alias_with(client, arbor_pixie_m2m_client_id());
+}
+
+fn apply_arbor_pixie_m2m_alias_with(
+    client: &mut crate::auth::ValidatedClient,
+    expected_sub: Option<&str>,
+) {
+    if let Some(expected) = expected_sub {
+        if client.id == expected {
+            client.name = Some(ARBOR_PIXIE_ACCOUNT_NAME.to_string());
         }
-        for fill in &mut order_created.fills {
-            hide_id(owned_accounts, &mut fill.owner_id);
-        }
-        for trade in &mut order_created.trades {
-            hide_id(owned_accounts, &mut trade.buyer_id);
-            hide_id(owned_accounts, &mut trade.seller_id);
-        }
-    };
-    if let ServerMessage {
-        message: Some(SM::Redeemed(Redeemed { account_id, .. })),
-        ..
-    } = msg
-    {
-        hide_id(owned_accounts, account_id);
     }
 }
 
-struct ActAs {
+const ARBOR_PIXIE_ACCOUNT_NAME: &str = "Arbor Pixie";
+
+fn arbor_pixie_m2m_client_id() -> Option<&'static str> {
+    static CLIENT_ID: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CLIENT_ID
+        .get_or_init(|| {
+            std::env::var("ARBOR_PIXIE_M2M_CLIENT_ID")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .as_deref()
+}
+
+async fn conditionally_hide_user_ids(
+    db: &DB,
+    owned_accounts: &[i64],
+    msg: &mut ServerMessage,
+) -> anyhow::Result<()> {
+    match &mut msg.message {
+        Some(SM::OrderCreated(order_created)) => {
+            if !db
+                .market_has_hide_account_ids(order_created.market_id)
+                .await?
+            {
+                return Ok(());
+            }
+            hide_id(owned_accounts, &mut order_created.account_id);
+            if let Some(order) = order_created.order.as_mut() {
+                hide_id(owned_accounts, &mut order.owner_id);
+            }
+            for fill in &mut order_created.fills {
+                hide_id(owned_accounts, &mut fill.owner_id);
+            }
+            for trade in &mut order_created.trades {
+                hide_id(owned_accounts, &mut trade.buyer_id);
+                hide_id(owned_accounts, &mut trade.seller_id);
+            }
+        }
+        Some(SM::Redeemed(redeemed)) => {
+            if !db.market_has_hide_account_ids(redeemed.fund_id).await? {
+                return Ok(());
+            }
+            hide_id(owned_accounts, &mut redeemed.account_id);
+        }
+        Some(SM::Orders(orders)) => {
+            if !db.market_has_hide_account_ids(orders.market_id).await? {
+                return Ok(());
+            }
+            for order in &mut orders.orders {
+                hide_id(owned_accounts, &mut order.owner_id);
+            }
+        }
+        Some(SM::Trades(trades)) => {
+            if !db.market_has_hide_account_ids(trades.market_id).await? {
+                return Ok(());
+            }
+            for trade in &mut trades.trades {
+                hide_id(owned_accounts, &mut trade.buyer_id);
+                hide_id(owned_accounts, &mut trade.seller_id);
+            }
+            for redemption in &mut trades.redemptions {
+                hide_id(owned_accounts, &mut redemption.account_id);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Extract `market_id` from a broadcast message, if it's a market-related message.
+fn broadcast_market_id(msg: &ServerMessage) -> Option<i64> {
+    match &msg.message {
+        Some(SM::Market(m)) => Some(m.id),
+        Some(SM::MarketSettled(ms)) => Some(ms.id),
+        Some(SM::OrderCreated(oc)) => Some(oc.market_id),
+        Some(SM::OrdersCancelled(oc)) => Some(oc.market_id),
+        Some(SM::Redeemed(r)) => Some(r.fund_id),
+        Some(SM::MarketStatusChanges(msc)) => Some(msc.market_id),
+        _ => None,
+    }
+}
+
+async fn broadcast_status_changes(
+    db: &DB,
+    market_id: i64,
+    subscriptions: &crate::subscriptions::Subscriptions,
+) -> anyhow::Result<()> {
+    let changes = db
+        .get_status_changes(market_id)
+        .await?
+        .into_iter()
+        .map(MarketStatusChange::from)
+        .collect();
+    let msg = server_message(
+        String::new(),
+        SM::MarketStatusChanges(MarketStatusChanges {
+            market_id,
+            changes,
+        }),
+    );
+    subscriptions.send_public(msg);
+    Ok(())
+}
+
+/// Check if a broadcast message should be filtered out due to market visibility restrictions.
+/// Returns true if the message should be SKIPPED (not sent to this client).
+async fn should_filter_for_visibility(
+    db: &DB,
+    owned_accounts: &[i64],
+    msg: &ServerMessage,
+) -> anyhow::Result<bool> {
+    let Some(market_id) = broadcast_market_id(msg) else {
+        return Ok(false);
+    };
+    let is_visible = db
+        .is_market_visible_to_any(market_id, owned_accounts)
+        .await?;
+    Ok(!is_visible)
+}
+
+struct ActAsInfo {
     request_id: String,
     account_id: i64,
     admin_as_user: bool,
 }
 
-#[allow(clippy::too_many_lines)]
-#[allow(clippy::similar_names)]
+enum HandleResult {
+    ActAs(ActAsInfo),
+    SudoChange {
+        request_id: String,
+        enabled: bool,
+    },
+    AdminRequired {
+        request_id: String,
+        msg_type: &'static str,
+    },
+}
+
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn handle_client_message(
     socket: &mut WebSocket,
     app_state: &AppState,
-    is_admin: bool,
+    cohort: &CohortState,
+    admin_id: Option<i64>,
     user_id: i64,
-    acting_as: &mut i64,
+    acting_as: i64,
     owned_accounts: &[i64],
+    is_read_only: &std::sync::atomic::AtomicBool,
+    is_cohort_member: bool,
     msg: ws::Message,
-) -> anyhow::Result<Option<ActAs>> {
+) -> anyhow::Result<Option<HandleResult>> {
+    let db = &cohort.db;
+    let subscriptions = &cohort.subscriptions;
+
     let ws::Message::Binary(msg) = msg else {
         let resp = request_failed(String::new(), "Unknown", "Expected Binary message");
         socket.send(resp).await?;
@@ -348,615 +693,737 @@ async fn handle_client_message(
         socket.send(resp).await?;
         return Ok(None);
     };
-    match msg {
-        CM::CreateMarket(create_market) => {
-            let Ok(min_settlement) = create_market.min_settlement.try_into() else {
-                let resp = request_failed(
-                    request_id,
-                    "CreateMarket",
-                    "Failed converting min_settlement to decimal",
-                );
-                socket.send(resp).await?;
-                return Ok(None);
+
+    macro_rules! fail {
+        ($msg_type:expr, $failure_message:expr) => {
+            let resp = request_failed(request_id, $msg_type, $failure_message);
+            socket.send(resp).await?;
+            return Ok(None);
+        };
+    }
+    macro_rules! check_mutate_rate_limit {
+        ($msg_type:expr) => {
+            if admin_id.is_some() {
+                if app_state
+                    .admin_mutate_ratelimit
+                    .check_key(&user_id)
+                    .is_err()
+                {
+                    fail!($msg_type, "ADMIN Rate Limited");
+                };
+            } else {
+                if app_state.mutate_ratelimit.check_key(&user_id).is_err() {
+                    fail!($msg_type, "Rate Limited");
+                };
             };
-            let Ok(max_settlement) = create_market.max_settlement.try_into() else {
-                let resp = request_failed(
-                    request_id,
-                    "CreateMarket",
-                    "Failed converting max_settlement to decimal",
-                );
-                socket.send(resp).await?;
-                return Ok(None);
+        };
+    }
+    macro_rules! check_expensive_rate_limit {
+        ($msg_type:expr) => {
+            if admin_id.is_some() {
+                if app_state
+                    .admin_expensive_ratelimit
+                    .check_key(&user_id)
+                    .is_err()
+                {
+                    fail!($msg_type, "ADMIN Rate Limited");
+                };
+            } else {
+                if app_state.expensive_ratelimit.check_key(&user_id).is_err() {
+                    fail!($msg_type, "Rate Limited");
+                };
             };
-            let Ok(redeem_fee) = create_market.redeem_fee.try_into() else {
-                let resp = request_failed(
-                    request_id,
-                    "CreateMarket",
-                    "Failed converting redeem_fee to decimal",
-                );
-                socket.send(resp).await?;
-                return Ok(None);
-            };
-            if app_state
-                .large_request_ratelimit
-                .check_key(&user_id)
-                .is_err()
+        };
+    }
+    // Check read-only and cohort-membership restrictions. Non-members (public-auction
+    // guests) can browse the auction but can't mutate cohort state.
+    macro_rules! check_mutation_allowed {
+        ($msg_type:expr) => {
+            if is_read_only.load(std::sync::atomic::Ordering::Relaxed) {
+                fail!($msg_type, "Cohort is read-only");
+            }
+            if !is_cohort_member {
+                fail!($msg_type, "Auction access only");
+            }
+        };
+    }
+    // Reject auction-related operations when this cohort has auctions disabled.
+    macro_rules! check_auctions_enabled {
+        ($msg_type:expr) => {
+            if !cohort
+                .auctions_enabled
+                .load(std::sync::atomic::Ordering::Relaxed)
             {
-                let resp = request_failed(request_id, "CreateMarket", "Rate Limited (mutating)");
-                socket.send(resp).await?;
-                return Ok(None);
+                fail!($msg_type, "Auctions are disabled for this cohort");
+            }
+        };
+    }
+
+    match msg {
+        CM::GetFullTradeHistory(GetFullTradeHistory { market_id }) => {
+            check_expensive_rate_limit!("GetFullTradeHistory");
+            let trades = match db.get_market_trades(market_id).await? {
+                Ok(trades) => trades,
+                Err(failure) => {
+                    fail!("GetFullTradeHistory", failure.message());
+                }
             };
-            let market = match app_state
-                .db
+            let mut msg = server_message(request_id, SM::Trades(trades.into()));
+            if admin_id.is_none() {
+                conditionally_hide_user_ids(db, owned_accounts, &mut msg).await?;
+            }
+            socket.send(msg.encode_to_vec().into()).await?;
+        }
+        CM::GetFullOrderHistory(GetFullOrderHistory { market_id }) => {
+            check_expensive_rate_limit!("GetFullOrderHistory");
+            let orders = match db.get_full_market_orders(market_id).await? {
+                Ok(orders) => orders,
+                Err(failure) => {
+                    fail!("GetFullTradeHistory", failure.message());
+                }
+            };
+            let mut msg = server_message(request_id, SM::Orders(orders.into()));
+            if admin_id.is_none() {
+                conditionally_hide_user_ids(db, owned_accounts, &mut msg).await?;
+            }
+            socket.send(msg.encode_to_vec().into()).await?;
+        }
+        CM::CreateMarket(create_market) => {
+            check_mutation_allowed!("CreateMarket");
+            check_expensive_rate_limit!("CreateMarket");
+            // Get the universe_id of the acting_as account
+            let universe_id = db.get_account_universe_id(acting_as).await?.unwrap_or(0);
+            match db
                 .create_market(
-                    &create_market.name,
-                    &create_market.description,
-                    user_id,
-                    min_settlement,
-                    max_settlement,
-                    &create_market.redeemable_for,
-                    redeem_fee,
+                    admin_id.unwrap_or(user_id),
+                    create_market,
+                    admin_id.is_some(),
+                    universe_id,
                 )
                 .await?
             {
-                CreateMarketStatus::Success(market) => market,
-                CreateMarketStatus::InvalidSettlements => {
-                    let resp =
-                        request_failed(request_id, "CreateMarket", "Invalid settlement prices");
-                    socket.send(resp).await?;
-                    return Ok(None);
+                Ok(market) => {
+                    let msg = server_message(request_id, SM::Market(market.into()));
+                    subscriptions.send_public(msg);
+                    // No need to broadcast MarketStatusChanges here — a freshly
+                    // created market has a single OPEN status_change row and
+                    // implies no pauses. Clients connecting later pick up the
+                    // baseline via send_initial_public_data; existing clients
+                    // would just get an empty/no-op message.
                 }
-                CreateMarketStatus::ConstituentNotFound => {
-                    let resp = request_failed(request_id, "CreateMarket", "Constituent not found");
-                    socket.send(resp).await?;
-                    return Ok(None);
-                }
-                CreateMarketStatus::InvalidMultiplier => {
-                    let resp = request_failed(request_id, "CreateMarket", "Invalid multiplier");
-                    socket.send(resp).await?;
-                    return Ok(None);
-                }
-                CreateMarketStatus::ConstituentSettled => {
-                    let resp =
-                        request_failed(request_id, "CreateMarket", "Constituent already settled");
-                    socket.send(resp).await?;
-                    return Ok(None);
-                }
-                CreateMarketStatus::InvalidRedeemFee => {
-                    let resp = request_failed(request_id, "CreateMarket", "Invalid redeem fee");
-                    socket.send(resp).await?;
-                    return Ok(None);
+                Err(failure) => {
+                    fail!("CreateMarket", failure.message());
                 }
             };
-            let msg = ServerMessage {
-                request_id,
-                message: Some(SM::Market(market.into())),
-            };
-            app_state.subscriptions.send_public(msg);
         }
         CM::SettleMarket(settle_market) => {
-            let Ok(settled_price) = settle_market.settle_price.try_into() else {
-                let resp = request_failed(
-                    request_id,
-                    "SettleMarket",
-                    "Failed converting settle_price to decimal",
-                );
-                socket.send(resp).await?;
-                return Ok(None);
-            };
-            if app_state
-                .large_request_ratelimit
-                .check_key(&user_id)
-                .is_err()
-            {
-                let resp = request_failed(request_id, "SettleMarket", "Rate Limited (mutating)");
-                socket.send(resp).await?;
-                return Ok(None);
-            };
-            match app_state
-                .db
-                .settle_market(settle_market.market_id, settled_price, user_id)
-                .await?
-            {
-                SettleMarketStatus::Success {
-                    affected_accounts: affected_users,
-                    transaction_info,
-                } => {
-                    let msg = ServerMessage {
-                        request_id,
-                        message: Some(SM::MarketSettled(MarketSettled {
-                            id: settle_market.market_id,
-                            settle_price: settle_market.settle_price,
-                            transaction: Some(transaction_info.into()),
-                        })),
-                    };
-                    app_state.subscriptions.send_public(msg);
-                    for user in affected_users {
-                        app_state.subscriptions.notify_portfolio(user);
+            check_mutation_allowed!("SettleMarket");
+            check_expensive_rate_limit!("SettleMarket");
+            match db.settle_market(user_id, admin_id, settle_market).await? {
+                Ok(db::MarketSettledWithAffectedAccounts {
+                    market_settled,
+                    affected_accounts,
+                    ..
+                }) => {
+                    let msg = server_message(request_id, SM::MarketSettled(market_settled.into()));
+                    subscriptions.send_public(msg);
+                    for account in affected_accounts {
+                        subscriptions.notify_portfolio(account);
                     }
                 }
-                SettleMarketStatus::AlreadySettled => {
-                    let resp = request_failed(request_id, "SettleMarket", "Market already settled");
-                    socket.send(resp).await?;
-                }
-                SettleMarketStatus::NotOwner => {
-                    let resp = request_failed(request_id, "SettleMarket", "Not market owner");
-                    socket.send(resp).await?;
-                }
-                SettleMarketStatus::InvalidSettlementPrice => {
-                    let resp =
-                        request_failed(request_id, "SettleMarket", "Invalid settlement price");
-                    socket.send(resp).await?;
-                }
-                SettleMarketStatus::ConstituentNotSettled => {
-                    let resp =
-                        request_failed(request_id, "SettleMarket", "Constituent not settled");
-                    socket.send(resp).await?;
+                Err(failure) => {
+                    fail!("SettleMarket", failure.message());
                 }
             }
         }
         CM::CreateOrder(create_order) => {
-            let Ok(size) = create_order.size.try_into() else {
-                let resp = request_failed(
-                    request_id,
-                    "CreateOrder",
-                    "Failed converting size to decimal",
-                );
-                socket.send(resp).await?;
-                return Ok(None);
-            };
-            let Ok(price) = create_order.price.try_into() else {
-                let resp = request_failed(
-                    request_id,
-                    "CreateOrder",
-                    "Failed converting price to decimal",
-                );
-                socket.send(resp).await?;
-                return Ok(None);
-            };
-            let side = match create_order.side() {
-                Side::Unknown => {
-                    let resp = request_failed(request_id, "CreateOrder", "Unknown side");
-                    socket.send(resp).await?;
-                    return Ok(None);
-                }
-                Side::Bid => db::Side::Bid,
-                Side::Offer => db::Side::Offer,
-            };
-            if app_state.mutate_ratelimit.check_key(&user_id).is_err() {
-                let resp = request_failed(request_id, "CreateOrder", "Rate Limited (mutating)");
-                socket.send(resp).await?;
-                return Ok(None);
-            };
-            match app_state
-                .db
-                .create_order(create_order.market_id, *acting_as, price, size, side)
-                .await?
-            {
-                CreateOrderStatus::MarketSettled => {
-                    let resp = request_failed(request_id, "CreateOrder", "Market already settled");
-                    socket.send(resp).await?;
-                }
-                CreateOrderStatus::InvalidSize => {
-                    let resp = request_failed(request_id, "CreateOrder", "Invalid size");
-                    socket.send(resp).await?;
-                }
-                CreateOrderStatus::InvalidPrice => {
-                    let resp = request_failed(request_id, "CreateOrder", "Invalid price");
-                    socket.send(resp).await?;
-                }
-                CreateOrderStatus::InsufficientFunds => {
-                    let resp = request_failed(request_id, "CreateOrder", "Insufficient funds");
-                    socket.send(resp).await?;
-                }
-                CreateOrderStatus::Success {
-                    order,
-                    fills,
-                    trades,
-                    transaction_info,
-                } => {
-                    for user_id in fills.iter().map(|fill| &fill.owner_id) {
-                        app_state.subscriptions.notify_portfolio(*user_id);
+            check_mutation_allowed!("CreateOrder");
+            check_mutate_rate_limit!("CreateOrder");
+            match db.create_order(acting_as, create_order).await? {
+                Ok(order_created) => {
+                    for user_id in order_created.fills.iter().map(|fill| &fill.owner_id) {
+                        subscriptions.notify_portfolio(*user_id);
                     }
-                    app_state.subscriptions.notify_portfolio(*acting_as);
-                    let order = order.map(|o| {
-                        let mut order = Order::from(o);
-                        order.sizes = vec![Size {
-                            transaction_id: order.transaction_id,
-                            size: order.size,
-                        }];
-                        order
-                    });
-                    let msg = ServerMessage {
-                        request_id,
-                        message: Some(SM::OrderCreated(OrderCreated {
-                            market_id: create_order.market_id,
-                            account_id: *acting_as,
-                            order,
-                            fills: fills.into_iter().map(OrderFill::from).collect(),
-                            trades: trades.into_iter().map(Trade::from).collect(),
-                            transaction: Some(transaction_info.into()),
-                        })),
-                    };
-                    app_state.subscriptions.send_public(msg);
+                    subscriptions.notify_portfolio(acting_as);
+                    let msg = server_message(request_id, SM::OrderCreated(order_created.into()));
+                    subscriptions.send_public(msg);
                 }
-                CreateOrderStatus::MarketNotFound => {
-                    let resp = request_failed(request_id, "CreateOrder", "Market not found");
-                    socket.send(resp).await?;
-                }
-                CreateOrderStatus::AccountNotFound => {
-                    tracing::error!("Authenticated user not found");
-                    let resp = request_failed(request_id, "CreateOrder", "User not found");
-                    socket.send(resp).await?;
+                Err(failure) => {
+                    fail!("CreateOrder", failure.message());
                 }
             }
         }
         CM::CancelOrder(cancel_order) => {
-            if app_state.mutate_ratelimit.check_key(&user_id).is_err() {
-                let resp = request_failed(request_id, "CancelOrder", "Rate Limited (mutating)");
-                socket.send(resp).await?;
-                return Ok(None);
-            };
-            match app_state
-                .db
-                .cancel_order(cancel_order.id, *acting_as)
-                .await?
-            {
-                CancelOrderStatus::Success {
-                    market_id,
-                    transaction_info,
-                } => {
-                    let resp = ServerMessage {
-                        request_id,
-                        message: Some(SM::OrdersCancelled(OrdersCancelled {
-                            order_ids: vec![cancel_order.id],
-                            market_id,
-                            transaction: Some(transaction_info.into()),
-                        })),
-                    };
-                    app_state.subscriptions.send_public(resp);
-                    app_state.subscriptions.notify_portfolio(*acting_as);
+            check_mutation_allowed!("CancelOrder");
+            check_mutate_rate_limit!("CancelOrder");
+            match db.cancel_order(acting_as, cancel_order).await? {
+                Ok(order_cancelled) => {
+                    let msg =
+                        server_message(request_id, SM::OrdersCancelled(order_cancelled.into()));
+                    subscriptions.send_public(msg);
+                    subscriptions.notify_portfolio(acting_as);
                 }
-                CancelOrderStatus::NotOwner => {
-                    let resp = request_failed(request_id, "CancelOrder", "Not order owner");
-                    socket.send(resp).await?;
-                }
-                CancelOrderStatus::NotFound => {
-                    let resp = request_failed(request_id, "CancelOrder", "Order not found");
-                    socket.send(resp).await?;
+                Err(failure) => {
+                    fail!("CancelOrder", failure.message());
                 }
             }
         }
         CM::MakeTransfer(make_transfer) => {
-            let Ok(amount) = make_transfer.amount.try_into() else {
-                let resp = request_failed(request_id, "MakeTransfer", "Failed parsing amount");
-                socket.send(resp).await?;
-                return Ok(None);
-            };
-            if app_state.mutate_ratelimit.check_key(&user_id).is_err() {
-                let resp = request_failed(request_id, "MakeTransfer", "Rate Limited (mutating)");
-                socket.send(resp).await?;
-                return Ok(None);
-            };
-            match app_state
-                .db
-                .make_transfer(
-                    user_id,
-                    make_transfer.from_account_id,
-                    make_transfer.to_account_id,
-                    amount,
-                    &make_transfer.note,
-                )
-                .await?
-            {
-                MakeTransferStatus::Success(transfer) => {
-                    let resp = server_message(request_id, SM::TransferCreated(transfer.into()));
+            // Public-auction guests need to be able to send clips even though
+            // they're not cohort members; only block on read-only here.
+            if is_read_only.load(std::sync::atomic::Ordering::Relaxed) {
+                fail!("MakeTransfer", "Cohort is read-only");
+            }
+            check_mutate_rate_limit!("MakeTransfer");
+            let from_account_id = make_transfer.from_account_id;
+            let to_account_id = make_transfer.to_account_id;
+            match db.make_transfer(admin_id, user_id, make_transfer).await? {
+                Ok(transfer) => {
+                    let resp =
+                        encode_server_message(request_id, SM::TransferCreated(transfer.into()));
                     // TODO: if the transfer is between two owned accounts,
                     // only send_private to the one lower on the ownership chain.
-                    app_state
-                        .subscriptions
-                        .send_private(make_transfer.from_account_id, resp.clone());
-                    app_state
-                        .subscriptions
-                        .send_private(make_transfer.to_account_id, resp);
-                    app_state
-                        .subscriptions
-                        .notify_portfolio(make_transfer.from_account_id);
-                    app_state
-                        .subscriptions
-                        .notify_portfolio(make_transfer.to_account_id);
+                    subscriptions.send_private(from_account_id, resp.clone());
+                    subscriptions.send_private(to_account_id, resp);
+                    subscriptions.notify_portfolio(from_account_id);
+                    subscriptions.notify_portfolio(to_account_id);
                 }
-                MakeTransferStatus::InsufficientFunds => {
-                    let resp = request_failed(request_id, "MakeTransfer", "Insufficient funds");
-                    socket.send(resp).await?;
+                Err(failure) => {
+                    fail!("MakeTransfer", failure.message());
                 }
-                MakeTransferStatus::InvalidAmount => {
-                    let resp = request_failed(request_id, "MakeTransfer", "Invalid amount");
-                    socket.send(resp).await?;
+            }
+        }
+        CM::Gift(gift) => {
+            check_mutate_rate_limit!("Gift");
+            let to_account_id = gift.to_account_id;
+            match db.gift(admin_id, user_id, gift).await? {
+                Ok(transfer) => {
+                    let resp =
+                        encode_server_message(request_id, SM::TransferCreated(transfer.into()));
+                    socket.send(resp.clone()).await?;
+                    subscriptions.send_private(to_account_id, resp);
+                    subscriptions.notify_portfolio(to_account_id);
                 }
-                MakeTransferStatus::FromAccountNotFound => {
-                    let resp = request_failed(request_id, "MakeTransfer", "Payer not found");
-                    socket.send(resp).await?;
+                Err(failure) => {
+                    fail!("Gift", failure.message());
                 }
-                MakeTransferStatus::ToAccountNotFound => {
-                    let resp = request_failed(request_id, "MakeTransfer", "Recipient not found");
-                    socket.send(resp).await?;
-                }
-                MakeTransferStatus::SameAccount => {
-                    let resp = request_failed(request_id, "MakeTransfer", "Cannot pay yourself");
-                    socket.send(resp).await?;
-                }
-                MakeTransferStatus::InitiatorNotUser => {
-                    tracing::error!("Initiator not user");
-                    let resp = request_failed(request_id, "MakeTransfer", "Initiator not user");
-                    socket.send(resp).await?;
-                }
-                MakeTransferStatus::AccountNotOwned => {
-                    let resp = request_failed(request_id, "MakeTransfer", "Account not owned");
-                    socket.send(resp).await?;
-                }
-                MakeTransferStatus::SharedOwnershipAccountHasOpenPositions => {
-                    let resp = request_failed(
+            }
+        }
+        CM::RedistributeOwnerCredit(redistribute) => {
+            check_mutate_rate_limit!("RedistributeOwnerCredit");
+            if admin_id.is_none() {
+                return Ok(Some(HandleResult::AdminRequired {
+                    request_id,
+                    msg_type: "RedistributeOwnerCredit",
+                }));
+            }
+            let account_id = redistribute.account_id;
+            match db.redistribute_owner_credit(redistribute).await? {
+                Ok(()) => {
+                    subscriptions.notify_portfolio(account_id);
+                    let resp = encode_server_message(
                         request_id,
-                        "MakeTransfer",
-                        "Shared ownership account has open positions",
+                        SM::OwnerCreditRedistributed(OwnerCreditRedistributed {}),
                     );
                     socket.send(resp).await?;
                 }
-                MakeTransferStatus::InsufficientCredit => {
-                    let resp = request_failed(request_id, "MakeTransfer", "Insufficient credit");
-                    socket.send(resp).await?;
+                Err(failure) => {
+                    fail!("RedistributeOwnerCredit", failure.message());
                 }
             }
         }
         CM::Out(out) => {
-            if app_state.mutate_ratelimit.check_key(&user_id).is_err() {
-                let resp = request_failed(request_id, "Out", "Rate Limited (mutating)");
-                socket.send(resp).await?;
-                return Ok(None);
-            };
-            let db::Out {
-                orders_affected,
-                transaction_info,
-            } = app_state.db.out(out.market_id, *acting_as).await?;
-            if !orders_affected.is_empty() {
-                app_state.subscriptions.notify_portfolio(*acting_as);
-            }
-            let msg = ServerMessage {
-                request_id: String::new(),
-                message: Some(SM::OrdersCancelled(OrdersCancelled {
-                    order_ids: orders_affected,
-                    market_id: out.market_id,
-                    transaction: Some(transaction_info.into()),
-                })),
-            };
-            app_state.subscriptions.send_public(msg);
-            let resp = server_message(request_id, SM::Out(out));
-            socket.send(resp).await?;
-        }
-        CM::Authenticate(_) => {
-            let resp = request_failed(
-                request_id,
-                "Authenticate",
-                "Already authenticated, to re-authenticate open a new websocket connection",
-            );
-            socket.send(resp).await?;
-        }
-        CM::ActAs(act_as) => {
-            if !owned_accounts.contains(&act_as.account_id) {
-                if !is_admin {
-                    let resp = request_failed(request_id, "ActAs", "Not owner of account");
+            check_mutation_allowed!("Out");
+            check_mutate_rate_limit!("Out");
+            match db.out(acting_as, out.clone()).await? {
+                Ok(orders_cancelled_list) => {
+                    if !orders_cancelled_list.is_empty() {
+                        subscriptions.notify_portfolio(acting_as);
+                    }
+                    for orders_cancelled in orders_cancelled_list {
+                        let msg = server_message(
+                            String::new(),
+                            SM::OrdersCancelled(orders_cancelled.into()),
+                        );
+                        subscriptions.send_public(msg);
+                    }
+                    let resp = encode_server_message(request_id, SM::Out(out));
                     socket.send(resp).await?;
-                    return Ok(None);
                 }
-                let Some(account) = app_state.db.get_account(act_as.account_id).await? else {
-                    let resp = request_failed(request_id, "ActAs", "Account not found");
-                    socket.send(resp).await?;
-                    return Ok(None);
-                };
-                if !account.is_user {
-                    let resp =
-                        request_failed(request_id, "ActAs", "Non owned account is not a user");
-                    socket.send(resp).await?;
-                    return Ok(None);
+                Err(failure) => {
+                    fail!("Out", failure.message());
                 }
-                return Ok(Some(ActAs {
-                    request_id,
-                    account_id: account.id,
-                    admin_as_user: true,
-                }));
             }
-            return Ok(Some(ActAs {
-                request_id,
-                account_id: act_as.account_id,
-                admin_as_user: false,
-            }));
         }
         CM::CreateAccount(create_account) => {
-            if app_state.mutate_ratelimit.check_key(&user_id).is_err() {
-                let resp = request_failed(request_id, "CreateAccount", "Rate Limited (mutating)");
-                socket.send(resp).await?;
-                return Ok(None);
-            };
-            let status = app_state
-                .db
-                .create_account(user_id, create_account.owner_id, create_account.name)
-                .await?;
+            check_mutation_allowed!("CreateAccount");
+            check_mutate_rate_limit!("CreateAccount");
+            let owner_id = create_account.owner_id;
+            let status = db.create_account(user_id, create_account).await?;
             match status {
-                CreateAccountStatus::Success(account) => {
-                    app_state
-                        .subscriptions
-                        .notify_ownership(create_account.owner_id);
-                    app_state.subscriptions.send_public(ServerMessage {
-                        request_id,
-                        message: Some(SM::AccountCreated(account.into())),
-                    });
+                Ok(account) => {
+                    subscriptions.notify_ownership(owner_id);
+                    let msg = server_message(request_id, SM::AccountCreated(account.into()));
+                    subscriptions.send_public(msg);
                 }
-                CreateAccountStatus::NameAlreadyExists => {
-                    let resp =
-                        request_failed(request_id, "CreateAccount", "Bot name already exists");
-                    socket.send(resp).await?;
-                }
-                CreateAccountStatus::EmptyName => {
-                    let resp =
-                        request_failed(request_id, "CreateAccount", "Bot name cannot be empty");
-                    socket.send(resp).await?;
-                }
-                CreateAccountStatus::InvalidOwner => {
-                    let resp = request_failed(request_id, "CreateAccount", "Invalid owner");
-                    socket.send(resp).await?;
+                Err(failure) => {
+                    fail!("CreateAccount", failure.message());
                 }
             }
         }
         CM::ShareOwnership(share_ownership) => {
-            if app_state.mutate_ratelimit.check_key(&user_id).is_err() {
-                let resp = request_failed(request_id, "ShareOwnership", "Rate Limited (mutating)");
-                socket.send(resp).await?;
-                return Ok(None);
+            check_mutation_allowed!("ShareOwnership");
+            check_mutate_rate_limit!("ShareOwnership");
+            let to_account_id = share_ownership.to_account_id;
+            match db.share_ownership(user_id, share_ownership).await? {
+                Ok(()) => {
+                    subscriptions.notify_ownership(to_account_id);
+                    let ownership_given_msg =
+                        encode_server_message(request_id, SM::OwnershipGiven(OwnershipGiven {}));
+                    socket.send(ownership_given_msg).await?;
+                }
+                Err(failure) => {
+                    fail!("ShareOwnership", failure.message());
+                }
+            }
+        }
+        CM::RevokeOwnership(revoke_ownership) => {
+            check_mutation_allowed!("RevokeOwnership");
+            check_mutate_rate_limit!("RevokeOwnership");
+            let from_account_id = revoke_ownership.from_account_id;
+            if admin_id.is_none() {
+                return Ok(Some(HandleResult::AdminRequired {
+                    request_id,
+                    msg_type: "RevokeOwnership",
+                }));
+            }
+            match db.revoke_ownership(revoke_ownership).await? {
+                Ok(()) => {
+                    subscriptions.notify_ownership(from_account_id);
+                    let ownership_revoked_msg = encode_server_message(
+                        request_id,
+                        SM::OwnershipRevoked(OwnershipRevoked {}),
+                    );
+                    socket.send(ownership_revoked_msg).await?;
+                }
+                Err(failure) => {
+                    fail!("RevokeOwnership", failure.message());
+                }
+            }
+        }
+        CM::Redeem(redeem) => {
+            check_mutation_allowed!("Redeem");
+            check_mutate_rate_limit!("Redeem");
+            match db.redeem(acting_as, redeem).await? {
+                Ok(redeemed) => {
+                    let msg = server_message(request_id, SM::Redeemed(redeemed.into()));
+                    subscriptions.send_public(msg);
+                    subscriptions.notify_portfolio(acting_as);
+                }
+                Err(failure) => {
+                    fail!("Redeem", failure.message());
+                }
+            }
+        }
+        CM::ExerciseOption(exercise) => {
+            check_mutate_rate_limit!("ExerciseOption");
+            match db.exercise_option(acting_as, exercise).await? {
+                Ok(result) => {
+                    let counterparty_id = result.counterparty_id;
+                    let msg = server_message(request_id, SM::OptionExercised(result.into()));
+                    subscriptions.send_public(msg);
+                    subscriptions.notify_portfolio(acting_as);
+                    subscriptions.notify_portfolio(counterparty_id);
+                }
+                Err(failure) => {
+                    fail!("ExerciseOption", failure.message());
+                }
+            }
+        }
+        CM::GetOptionContracts(get_contracts) => {
+            check_expensive_rate_limit!("GetOptionContracts");
+            let contracts = db
+                .get_option_contracts(get_contracts.market_id, acting_as)
+                .await?;
+            let msg = server_message(
+                request_id,
+                SM::OptionContracts(OptionContracts {
+                    market_id: get_contracts.market_id,
+                    contracts: contracts.into_iter().map(Into::into).collect(),
+                }),
+            );
+            socket.send(msg.encode_to_vec().into()).await?;
+        }
+        CM::CreateRedeemCode(create_redeem_code) => {
+            check_mutate_rate_limit!("CreateRedeemCode");
+            if admin_id.is_none() {
+                return Ok(Some(HandleResult::AdminRequired {
+                    request_id,
+                    msg_type: "CreateRedeemCode",
+                }));
+            }
+            match db.create_redeem_code(user_id, create_redeem_code).await? {
+                Ok(created) => {
+                    let resp = encode_server_message(request_id, SM::RedeemCodeCreated(created));
+                    socket.send(resp).await?;
+                }
+                Err(failure) => {
+                    fail!("CreateRedeemCode", failure.message());
+                }
+            }
+        }
+        CM::ClaimRedeemCode(claim) => {
+            // Intentionally no `check_mutation_allowed` — public-auction guests
+            // (non-cohort-members) are allowed to redeem codes.
+            check_mutate_rate_limit!("ClaimRedeemCode");
+            if is_read_only.load(std::sync::atomic::Ordering::Relaxed) {
+                fail!("ClaimRedeemCode", "Cohort is read-only");
+            }
+            let code_for_response = claim.code.trim().to_uppercase();
+            match db.claim_redeem_code(acting_as, claim).await? {
+                Ok((transfer, amount)) => {
+                    let from_account_id = transfer.from_account_id;
+                    let to_account_id = transfer.to_account_id;
+                    let claimed = SM::RedeemCodeClaimed(RedeemCodeClaimed {
+                        code: code_for_response,
+                        amount: amount.try_into().unwrap_or(0.0),
+                    });
+                    let resp = encode_server_message(request_id, claimed);
+                    socket.send(resp).await?;
+                    // Surface the underlying transfer to both sides so it shows
+                    // up in transfer history exactly like a normal transfer.
+                    let transfer_msg = encode_server_message(
+                        String::new(),
+                        SM::TransferCreated(transfer.into()),
+                    );
+                    subscriptions.send_private(from_account_id, transfer_msg.clone());
+                    subscriptions.send_private(to_account_id, transfer_msg);
+                    subscriptions.notify_portfolio(from_account_id);
+                    subscriptions.notify_portfolio(to_account_id);
+                }
+                Err(failure) => {
+                    fail!("ClaimRedeemCode", failure.message());
+                }
+            }
+        }
+        CM::Authenticate(_) => {
+            fail!("Authenticate", "Already authenticated");
+        }
+        CM::ActAs(act_as) => {
+            if !owned_accounts.contains(&act_as.account_id) {
+                if admin_id.is_none() {
+                    return Ok(Some(HandleResult::AdminRequired {
+                        request_id,
+                        msg_type: "ActAs",
+                    }));
+                }
+                let Some(account) = db.get_account(act_as.account_id).await? else {
+                    fail!("ActAs", "Account not found");
+                };
+                if !account.is_user {
+                    fail!("ActAs", "Non owned account is not a user");
+                }
+                return Ok(Some(HandleResult::ActAs(ActAsInfo {
+                    request_id,
+                    account_id: account.id,
+                    admin_as_user: true,
+                })));
+            }
+            return Ok(Some(HandleResult::ActAs(ActAsInfo {
+                request_id,
+                account_id: act_as.account_id,
+                admin_as_user: false,
+            })));
+        }
+        CM::SetSudo(SetSudo { enabled }) => {
+            // Permission check happens in caller (needs is_admin, not effective admin_id)
+            return Ok(Some(HandleResult::SudoChange {
+                request_id,
+                enabled,
+            }));
+        }
+        CM::CreateUniverse(create_universe) => {
+            check_mutation_allowed!("CreateUniverse");
+            check_expensive_rate_limit!("CreateUniverse");
+            match db
+                .create_universe(user_id, create_universe.name, create_universe.description)
+                .await?
+            {
+                Ok(universe) => {
+                    let msg = server_message(request_id, SM::Universe(universe.into()));
+                    subscriptions.send_public(msg);
+                }
+                Err(failure) => {
+                    fail!("CreateUniverse", failure.message());
+                }
+            }
+        }
+        CM::EditMarket(edit_market) => {
+            check_mutation_allowed!("EditMarket");
+            // Check if user is admin or owner of the market
+            let Some((owner_id, status)) = db.get_market_owner_and_status(edit_market.id).await?
+            else {
+                fail!("EditMarket", "Market not found");
             };
-            match app_state
-                .db
-                .share_ownership(
-                    user_id,
-                    share_ownership.of_account_id,
-                    share_ownership.to_account_id,
+
+            let is_owner = owner_id == user_id;
+            let is_admin = admin_id.is_some();
+
+            // Determine what fields are being edited
+            let status_changed = status != i64::from(edit_market.status);
+            let editing_admin_only_fields = edit_market.name.is_some()
+                || edit_market.pinned.is_some()
+                || status_changed
+                || edit_market.update_visible_to.is_some()
+                || edit_market.hide_account_ids.is_some()
+                || edit_market.redeemable_settings.is_some();
+
+            // Check permissions
+            if editing_admin_only_fields && !is_admin {
+                fail!("EditMarket", "Only admins can edit market name, status, pinned, visibility, and redeemable settings");
+            }
+
+            if edit_market.description.is_some() && !is_admin && !is_owner {
+                fail!(
+                    "EditMarket",
+                    "You can only edit your own market's description"
+                );
+            }
+
+            // Note: admin_id.is_some() already implies sudo is enabled
+
+            match db.edit_market(edit_market).await? {
+                Ok(market) => {
+                    let market_id = market.market.id;
+                    let msg = server_message(request_id, SM::Market(market.into()));
+                    subscriptions.send_public(msg);
+                    if status_changed {
+                        broadcast_status_changes(db, market_id, subscriptions).await?;
+                    }
+                }
+                Err(err) => {
+                    fail!("EditMarket", err.message());
+                }
+            };
+        }
+        CM::CreateAuction(create_auction) => {
+            check_auctions_enabled!("CreateAuction");
+            if is_read_only.load(std::sync::atomic::Ordering::Relaxed) {
+                fail!("CreateAuction", "Cohort is read-only");
+            }
+            check_expensive_rate_limit!("CreateMarket");
+            match db.create_auction(user_id, create_auction).await? {
+                Ok(auction) => {
+                    let msg = server_message(request_id, SM::Auction(auction.into()));
+                    subscriptions.send_public(msg);
+                }
+                Err(failure) => {
+                    fail!("CreateAuction", failure.message());
+                }
+            };
+        }
+        CM::SettleAuction(settle_auction) => {
+            check_auctions_enabled!("SettleAuction");
+            if is_read_only.load(std::sync::atomic::Ordering::Relaxed) {
+                fail!("SettleAuction", "Cohort is read-only");
+            }
+            check_expensive_rate_limit!("SettleAuction");
+            match admin_id {
+                None => {
+                    fail!("SettleAuction", "only admins can settle auctions");
+                }
+                Some(admin_id) => match db.settle_auction(admin_id, settle_auction).await? {
+                    Ok(db::AuctionSettledWithAffectedAccounts {
+                        auction_settled,
+                        affected_accounts,
+                        transfers,
+                    }) => {
+                        let msg =
+                            server_message(request_id, SM::AuctionSettled(auction_settled.into()));
+                        subscriptions.send_public(msg);
+                        for transfer in transfers {
+                            let transfer_msg = encode_server_message(
+                                String::new(),
+                                SM::TransferCreated(transfer.into()),
+                            );
+                            for &account in &affected_accounts {
+                                subscriptions.send_private(account, transfer_msg.clone());
+                            }
+                        }
+                        for &account in &affected_accounts {
+                            subscriptions.notify_portfolio(account);
+                        }
+                    }
+                    Err(failure) => {
+                        fail!("SettleAuction", failure.message());
+                    }
+                },
+            }
+        }
+        CM::BuyAuction(buy_auction) => {
+            check_auctions_enabled!("BuyAuction");
+            if is_read_only.load(std::sync::atomic::Ordering::Relaxed) {
+                fail!("BuyAuction", "Cohort is read-only");
+            }
+            check_expensive_rate_limit!("SettleAuction");
+            match db
+                .settle_auction(
+                    0,
+                    SettleAuction {
+                        auction_id: buy_auction.auction_id,
+                        buyer_id: user_id,
+                        settle_price: -1.0,
+                        contributions: vec![],
+                        owner_id: None,
+                    },
                 )
                 .await?
             {
-                db::ShareOwnershipStatus::Success => {
-                    app_state
-                        .subscriptions
-                        .notify_ownership(share_ownership.to_account_id);
-                    let ownership_given_msg =
-                        server_message(request_id, SM::OwnershipGiven(OwnershipGiven {}));
-                    socket.send(ownership_given_msg).await?;
+                Ok(db::AuctionSettledWithAffectedAccounts {
+                    auction_settled,
+                    affected_accounts,
+                    transfers,
+                }) => {
+                    let msg =
+                        server_message(request_id, SM::AuctionSettled(auction_settled.into()));
+                    subscriptions.send_public(msg);
+                    for transfer in transfers {
+                        let transfer_msg = encode_server_message(
+                            String::new(),
+                            SM::TransferCreated(transfer.into()),
+                        );
+                        for &account in &affected_accounts {
+                            subscriptions.send_private(account, transfer_msg.clone());
+                        }
+                    }
+                    for &account in &affected_accounts {
+                        subscriptions.notify_portfolio(account);
+                    }
                 }
-                db::ShareOwnershipStatus::AlreadyOwner => {
-                    let resp = request_failed(request_id, "ShareOwnership", "Already owner");
-                    socket.send(resp).await?;
+                Err(failure) => {
+                    fail!("BuyAuction", failure.message());
                 }
-                db::ShareOwnershipStatus::NotOwner => {
-                    let resp = request_failed(request_id, "ShareOwnership", "Not owner");
-                    socket.send(resp).await?;
-                }
-                db::ShareOwnershipStatus::OwnerNotAUser => {
-                    let resp = request_failed(request_id, "ShareOwnership", "Owner not a user");
-                    socket.send(resp).await?;
-                }
-                db::ShareOwnershipStatus::RecipientNotAUser => {
-                    let resp = request_failed(request_id, "ShareOwnership", "Recipient not a user");
-                    socket.send(resp).await?;
-                }
-            }
+            };
         }
-        CM::GetFullTradeHistory(GetFullTradeHistory { market_id }) => {
-            let mut trades = match app_state.db.get_market_trades(market_id).await? {
-                db::GetMarketTradesStatus::Success(trades) => trades,
-                db::GetMarketTradesStatus::MarketNotFound => {
-                    let resp =
-                        request_failed(request_id, "GetFullTradeHistory", "Market not found");
-                    socket.send(resp).await?;
-                    return Ok(None);
-                }
-            };
-            if !is_admin {
-                for trade in &mut trades {
-                    hide_id(owned_accounts, &mut trade.buyer_id);
-                    hide_id(owned_accounts, &mut trade.seller_id);
-                }
+        CM::DeleteAuction(delete_auction) => {
+            check_auctions_enabled!("DeleteAuction");
+            if is_read_only.load(std::sync::atomic::Ordering::Relaxed) {
+                fail!("DeleteAuction", "Cohort is read-only");
             }
-            let msg = server_message(
-                request_id,
-                SM::Trades(Trades {
-                    market_id,
-                    trades: trades.into_iter().map(Trade::from).collect(),
-                    has_full_history: true,
-                }),
-            );
-            socket.send(msg).await?;
-        }
-        CM::GetFullOrderHistory(GetFullOrderHistory { market_id }) => {
-            let mut orders = match app_state.db.get_full_market_orders(market_id).await? {
-                db::GetMarketOrdersStatus::Success(orders) => orders,
-                db::GetMarketOrdersStatus::MarketNotFound => {
-                    let resp =
-                        request_failed(request_id, "GetFullTradeHistory", "Market not found");
-                    socket.send(resp).await?;
-                    return Ok(None);
-                }
-            };
-            if !is_admin {
-                for order in &mut orders {
-                    hide_id(owned_accounts, &mut order.0.owner_id);
-                }
-            }
-            let msg = server_message(
-                request_id,
-                SM::Orders(Orders {
-                    market_id,
-                    orders: orders.into_iter().map(Order::from).collect(),
-                    has_full_history: true,
-                }),
-            );
-            socket.send(msg).await?;
-        }
-        CM::Redeem(Redeem {
-            fund_id,
-            amount: amount_float,
-        }) => {
-            if app_state.mutate_ratelimit.check_key(&user_id).is_err() {
-                let resp = request_failed(request_id, "Redeem", "Rate Limited (mutating)");
-                socket.send(resp).await?;
-                return Ok(None);
-            };
-            let Ok(amount) = amount_float.try_into() else {
-                let resp =
-                    request_failed(request_id, "Redeem", "Failed converting amount to decimal");
-                socket.send(resp).await?;
-                return Ok(None);
-            };
-            match app_state.db.redeem(fund_id, *acting_as, amount).await? {
-                db::RedeemStatus::Success { transaction_info } => {
-                    let msg = ServerMessage {
+            check_expensive_rate_limit!("DeleteAuction");
+            match db.delete_auction(user_id, delete_auction, admin_id).await? {
+                Ok(auction_id) => {
+                    let msg = server_message(
                         request_id,
-                        message: Some(SM::Redeemed(Redeemed {
-                            transaction: Some(transaction_info.into()),
-                            account_id: *acting_as,
-                            fund_id,
-                            amount: amount_float,
-                        })),
-                    };
-                    app_state.subscriptions.send_public(msg);
-                    app_state.subscriptions.notify_portfolio(*acting_as);
-                }
-                db::RedeemStatus::MarketNotRedeemable => {
-                    let resp = request_failed(request_id, "Redeem", "Fund not found");
-                    socket.send(resp).await?;
-                }
-                db::RedeemStatus::MarketSettled => {
-                    let resp = request_failed(
-                        request_id,
-                        "Redeem",
-                        "One of the constituents is already settled",
+                        SM::AuctionDeleted(AuctionDeleted { auction_id }),
                     );
-                    socket.send(resp).await?;
+                    subscriptions.send_public(msg);
                 }
-                db::RedeemStatus::InsufficientFunds => {
-                    let resp = request_failed(request_id, "Redeem", "Insufficient funds");
-                    socket.send(resp).await?;
-                }
-                db::RedeemStatus::InvalidAmount => {
-                    let resp = request_failed(request_id, "Redeem", "Invalid amount");
-                    socket.send(resp).await?;
-                }
-                db::RedeemStatus::RedeemerNotFound => {
-                    tracing::error!("Redeemer not found");
-                    let resp = request_failed(request_id, "Redeem", "Redeemer not found");
-                    socket.send(resp).await?;
+                Err(failure) => {
+                    fail!("DeleteAuction", failure.message());
                 }
             }
         }
-    };
+        CM::EditAuction(edit_auction) => {
+            check_auctions_enabled!("EditAuction");
+            if is_read_only.load(std::sync::atomic::Ordering::Relaxed) {
+                fail!("EditAuction", "Cohort is read-only");
+            }
+            check_expensive_rate_limit!("EditAuction");
+            match db.edit_auction(user_id, edit_auction, admin_id).await? {
+                Ok(auction) => {
+                    let msg = server_message(request_id, SM::Auction(auction.into()));
+                    subscriptions.send_public(msg);
+                }
+                Err(failure) => {
+                    fail!("EditAuction", failure.message());
+                }
+            }
+        }
+        CM::CreateMarketType(create_market_type) => {
+            if is_read_only.load(std::sync::atomic::Ordering::Relaxed) {
+                fail!("CreateMarketType", "Cohort is read-only");
+            }
+            if admin_id.is_none() {
+                return Ok(Some(HandleResult::AdminRequired {
+                    request_id,
+                    msg_type: "CreateMarketType",
+                }));
+            }
+            check_expensive_rate_limit!("CreateMarketType");
+            match db
+                .create_market_type(
+                    create_market_type.name,
+                    create_market_type.description,
+                    create_market_type.public,
+                )
+                .await?
+            {
+                Ok(market_type) => {
+                    let msg = server_message(request_id, SM::MarketType(market_type.into()));
+                    subscriptions.send_public(msg);
+                }
+                Err(failure) => {
+                    fail!("CreateMarketType", failure.message());
+                }
+            };
+        }
+        CM::DeleteMarketType(delete_market_type) => {
+            if is_read_only.load(std::sync::atomic::Ordering::Relaxed) {
+                fail!("DeleteMarketType", "Cohort is read-only");
+            }
+            if admin_id.is_none() {
+                return Ok(Some(HandleResult::AdminRequired {
+                    request_id,
+                    msg_type: "DeleteMarketType",
+                }));
+            }
+            check_expensive_rate_limit!("DeleteMarketType");
+            match db
+                .delete_market_type(delete_market_type.market_type_id)
+                .await?
+            {
+                Ok(market_type_id) => {
+                    let msg = server_message(
+                        request_id,
+                        SM::MarketTypeDeleted(MarketTypeDeleted { market_type_id }),
+                    );
+                    subscriptions.send_public(msg);
+                }
+                Err(failure) => {
+                    fail!("DeleteMarketType", failure.message());
+                }
+            };
+        }
+        CM::CreateMarketGroup(create_market_group) => {
+            if is_read_only.load(std::sync::atomic::Ordering::Relaxed) {
+                fail!("CreateMarketGroup", "Cohort is read-only");
+            }
+            if admin_id.is_none() {
+                return Ok(Some(HandleResult::AdminRequired {
+                    request_id,
+                    msg_type: "CreateMarketGroup",
+                }));
+            }
+            check_expensive_rate_limit!("CreateMarketGroup");
+            match db
+                .create_market_group(
+                    create_market_group.name,
+                    create_market_group.description,
+                    create_market_group.type_id,
+                )
+                .await?
+            {
+                Ok(market_group) => {
+                    let msg = server_message(request_id, SM::MarketGroup(market_group.into()));
+                    subscriptions.send_public(msg);
+                }
+                Err(failure) => {
+                    fail!("CreateMarketGroup", failure.message());
+                }
+            };
+        }
+    }
     Ok(None)
 }
 
@@ -985,12 +1452,17 @@ struct AuthenticatedClient {
     is_admin: bool,
     act_as: Option<i64>,
     owned_accounts: Vec<i64>,
+    is_cohort_member: bool,
 }
 
+#[allow(clippy::too_many_lines)]
 async fn authenticate(
     app_state: &AppState,
+    cohort: &CohortState,
     socket: &mut WebSocket,
 ) -> anyhow::Result<AuthenticatedClient> {
+    let db = &cohort.db;
+    let global_db = &app_state.global_db;
     loop {
         match socket.recv().await {
             Some(Ok(ws::Message::Binary(msg))) => {
@@ -1006,77 +1478,256 @@ async fn authenticate(
                 };
                 let id_jwt = (!authenticate.id_jwt.is_empty()).then_some(authenticate.id_jwt);
                 let act_as = (authenticate.act_as != 0).then_some(authenticate.act_as);
-                let valid_client =
-                    match validate_access_and_id(&authenticate.jwt, id_jwt.as_deref()).await {
-                        Ok(valid_client) => valid_client,
-                        Err(e) => {
-                            tracing::error!("JWT validation failed: {e}");
-                            let resp =
-                                request_failed(request_id, "Authenticate", "JWT validation failed");
-                            socket.send(resp).await?;
-                            continue;
-                        }
-                    };
-                let is_admin = valid_client.roles.contains(&Role::Admin);
-                let initial_balance = if is_admin { dec!(1_000_000) } else { dec!(0) };
-                let status = app_state
-                    .db
-                    .ensure_user_created(
-                        &valid_client.id,
-                        valid_client.name.as_deref(),
-                        initial_balance,
-                    )
-                    .await?;
-
-                let id = match status {
-                    EnsureUserCreatedStatus::CreatedOrUpdated { id, name } => {
-                        app_state.subscriptions.send_public(ServerMessage {
-                            request_id: String::new(),
-                            message: Some(SM::AccountCreated(Account {
-                                id,
-                                name: name.to_string(),
-                                is_user: true,
-                            })),
-                        });
-                        id
+                let mut valid_client = match validate_access_and_id_or_test(
+                    &authenticate.jwt,
+                    id_jwt.as_deref(),
+                )
+                .await
+                {
+                    Ok(valid_client) => valid_client,
+                    Err(e) => {
+                        tracing::error!("JWT validation failed: {e}");
+                        let resp =
+                            request_failed(request_id, "Authenticate", "JWT validation failed");
+                        socket.send(resp).await?;
+                        continue;
                     }
-                    EnsureUserCreatedStatus::Unchanged { id } => id,
-                    EnsureUserCreatedStatus::NoNameProvidedForNewUser => {
+                };
+                // The scenarios server's M2M token has no id_token, so it
+                // would otherwise come in nameless and the platform would
+                // create / find an "Unnamed-XXXX" global_user. Force the
+                // display name to "Arbor Pixie" so `ensure_user_created_by_global_id`
+                // hits the existing unclaimed Arbor Pixie account row in old
+                // cohorts and reuses it.
+                apply_arbor_pixie_m2m_alias(&mut valid_client);
+
+                // Get or create global user. The Kinde admin role is synced into
+                // `global_user.is_admin` so downstream code can rely on a single source of truth.
+                // When the id_token yields a real display name we call `ensure_global_user`
+                // for its create-with-name path; otherwise we fall back to
+                // `find_or_create_global_user`, which preserves any previously-populated name
+                // and, for brand-new rows, generates an `Unnamed-XXXX` placeholder rather than
+                // exposing the Kinde sub or the user's email in the UI.
+                let is_kinde_admin = valid_client.roles.contains(&Role::Admin);
+                let global_user_result = if let Some(display_name) = valid_client
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    global_db
+                        .ensure_global_user(
+                            &valid_client.id,
+                            display_name,
+                            valid_client.email.as_deref(),
+                            is_kinde_admin,
+                        )
+                        .await
+                } else {
+                    global_db
+                        .find_or_create_global_user(
+                            &valid_client.id,
+                            valid_client.email.as_deref(),
+                            is_kinde_admin,
+                        )
+                        .await
+                };
+                let global_user = match global_user_result {
+                    Ok(user) => user,
+                    Err(e) => {
+                        tracing::error!("Failed to ensure global user: {e}");
                         let resp = request_failed(
                             request_id,
                             "Authenticate",
-                            "No name provided for new user",
+                            "Failed to create global user",
                         );
                         socket.send(resp).await?;
                         continue;
                     }
                 };
-                if app_state.large_request_ratelimit.check_key(&id).is_err() {
-                    let resp =
-                        request_failed(request_id, "Authenticate", "Rate Limited (connecting)");
-                    socket.send(resp).await?;
-                    return Err(anyhow::anyhow!("Rate Limited (connecting)"));
+
+                // Link email-based pre-authorizations if we have an email
+                if let Some(email) = &valid_client.email {
+                    if let Err(e) = global_db.link_email_to_user(email, global_user.id).await {
+                        tracing::warn!("Failed to link email to user: {e}");
+                    }
                 }
-                let owned_accounts = app_state.db.get_owned_accounts(id).await?;
-                if let Some(act_as) = act_as {
-                    if !owned_accounts.contains(&act_as) {
-                        let resp =
-                            request_failed(request_id, "Authenticate", "Not owner of account");
+
+                let is_admin = global_user.is_admin;
+
+                // Check cohort access
+                #[allow(unused_mut)]
+                let mut is_member = global_db
+                    .is_cohort_member(global_user.id, cohort.info.id)
+                    .await
+                    .unwrap_or(false);
+
+                // In dev-mode, auto-add users as cohort members unless the test token
+                // explicitly opts out (login form's "Join cohort" checkbox unchecked).
+                #[cfg(feature = "dev-mode")]
+                if !is_member && valid_client.auto_join_cohort != Some(false) {
+                    if let Err(e) = global_db
+                        .add_member_by_user_id(cohort.info.id, global_user.id, None)
+                        .await
+                    {
+                        tracing::warn!("Failed to auto-add user as cohort member: {e}");
+                    } else {
+                        is_member = true;
+                    }
+                }
+
+                // Admins always get added to the cohort member list when they access
+                if is_admin && !is_member {
+                    if let Err(e) = global_db
+                        .add_member_by_user_id(cohort.info.id, global_user.id, None)
+                        .await
+                    {
+                        tracing::warn!("Failed to add admin as cohort member: {e}");
+                    } else {
+                        is_member = true;
+                    }
+                }
+
+                // Per-cohort auction toggle. When on, anyone (members, admins,
+                // public guests) can reach this cohort's auctions. When off, no
+                // auction data flows and non-members can't connect at all.
+                let auction_enabled = cohort
+                    .auctions_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed);
+
+                // Admins and cohort members are full members. Everyone else can connect
+                // only as a public-auction guest (when auction_enabled), with cohort-mutating
+                // operations gated by `is_cohort_member` downstream.
+                let is_cohort_member = is_admin || is_member;
+
+                if !is_cohort_member && !auction_enabled {
+                    let resp = request_failed(
+                        request_id,
+                        "Authenticate",
+                        "You are not authorized for this cohort",
+                    );
+                    socket.send(resp).await?;
+                    continue;
+                }
+
+                let initial_balance = match global_db
+                    .get_member_initial_balance(cohort.info.id, global_user.id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|s| rust_decimal::Decimal::from_str_exact(&s).ok())
+                {
+                    Some(bal) => bal,
+                    None => {
+                        if is_admin {
+                            dec!(100_000_000)
+                        } else {
+                            dec!(0)
+                        }
+                    }
+                };
+
+                // Create/find user in cohort DB using global_user_id. Use the already-resolved
+                // `display_name` from the global user record, which our ensure/find-or-create
+                // logic above has populated with the best name available.
+                let result = db
+                    .ensure_user_created_by_global_id(
+                        global_user.id,
+                        valid_client.email.as_deref(),
+                        &global_user.display_name,
+                        initial_balance,
+                    )
+                    .await?;
+
+                let id = match result {
+                    Ok(db::EnsureUserCreatedSuccess {
+                        id,
+                        name: Some(name),
+                    }) => {
+                        let msg = server_message(
+                            String::new(),
+                            SM::AccountCreated(Account {
+                                id,
+                                name: name.clone(),
+                                is_user: true,
+                                universe_id: 0,
+                                color: None,
+                            }),
+                        );
+                        cohort.subscriptions.send_public(msg);
+                        id
+                    }
+                    Ok(EnsureUserCreatedSuccess { id, name: None }) => id,
+                    Err(failure) => {
+                        let resp = request_failed(request_id, "Authenticate", failure.message());
                         socket.send(resp).await?;
                         continue;
                     }
-                }
-                let resp = ServerMessage {
-                    request_id,
-                    message: Some(SM::Authenticated(Authenticated { account_id: id })),
                 };
-                socket.send(resp.encode_to_vec().into()).await?;
+                if app_state.expensive_ratelimit.check_key(&id).is_err() {
+                    let resp = request_failed(request_id, "Authenticate", "Rate Limited");
+                    socket.send(resp).await?;
+                    return Err(anyhow::anyhow!("Rate Limited"));
+                }
+                let owned_accounts = db.get_owned_accounts(id).await?;
+                if let Some(act_as) = act_as {
+                    if !owned_accounts.contains(&act_as) {
+                        // Admins can act-as any user account (matches the runtime
+                        // CM::ActAs handler). Without this, an admin who saved an
+                        // act-as preference for a non-owned account couldn't auth
+                        // with it on reconnect — they'd auth as themselves and
+                        // have to switch again.
+                        if !is_admin {
+                            let resp =
+                                request_failed(request_id, "Authenticate", "Not owner of account");
+                            socket.send(resp).await?;
+                            continue;
+                        }
+                        let Some(account) = db.get_account(act_as).await? else {
+                            let resp =
+                                request_failed(request_id, "Authenticate", "Account not found");
+                            socket.send(resp).await?;
+                            continue;
+                        };
+                        if !account.is_user {
+                            let resp = request_failed(
+                                request_id,
+                                "Authenticate",
+                                "Non owned account is not a user",
+                            );
+                            socket.send(resp).await?;
+                            continue;
+                        }
+                    }
+                }
+                let resp = encode_server_message(
+                    request_id,
+                    SM::Authenticated(Authenticated {
+                        account_id: id,
+                        is_cohort_member,
+                        auction_enabled,
+                        is_admin,
+                    }),
+                );
+                socket.send(resp).await?;
                 return Ok(AuthenticatedClient {
                     id,
                     is_admin,
                     act_as,
                     owned_accounts,
+                    is_cohort_member,
                 });
+            }
+            Some(Ok(ws::Message::Ping(payload))) => {
+                // Respond to ping with pong during authentication
+                socket.send(ws::Message::Pong(payload)).await?;
+            }
+            Some(Ok(ws::Message::Pong(_))) => {
+                // Ignore pong messages
+            }
+            Some(Ok(ws::Message::Close(close_frame))) => {
+                let _ = socket.send(ws::Message::Close(close_frame)).await;
+                bail!("Client closed connection during authentication");
             }
             Some(Ok(_)) => {
                 let resp = request_failed(String::new(), "Unknown", "Expected Binary message");
@@ -1089,7 +1740,7 @@ async fn authenticate(
 
 fn request_failed(request_id: String, kind: &str, message: &str) -> ws::Message {
     tracing::error!("Request failed: {kind}, {message}");
-    server_message(
+    encode_server_message(
         request_id,
         SM::RequestFailed(RequestFailed {
             request_details: Some(RequestDetails { kind: kind.into() }),
@@ -1101,11 +1752,57 @@ fn request_failed(request_id: String, kind: &str, message: &str) -> ws::Message 
 }
 
 #[must_use]
-pub fn server_message(request_id: String, message: SM) -> ws::Message {
+pub fn encode_server_message(request_id: String, message: SM) -> ws::Message {
+    server_message(request_id, message).encode_to_vec().into()
+}
+
+fn server_message(request_id: String, message: SM) -> ServerMessage {
     ServerMessage {
         request_id,
         message: Some(message),
     }
-    .encode_to_vec()
-    .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::ValidatedClient;
+
+    fn client(id: &str, name: Option<&str>) -> ValidatedClient {
+        ValidatedClient {
+            id: id.to_string(),
+            roles: vec![],
+            name: name.map(String::from),
+            email: None,
+            auto_join_cohort: None,
+        }
+    }
+
+    #[test]
+    fn arbor_pixie_alias_renames_matching_sub() {
+        let mut c = client("m2m_scenarios", None);
+        apply_arbor_pixie_m2m_alias_with(&mut c, Some("m2m_scenarios"));
+        assert_eq!(c.name.as_deref(), Some(ARBOR_PIXIE_ACCOUNT_NAME));
+    }
+
+    #[test]
+    fn arbor_pixie_alias_overrides_existing_name_for_match() {
+        let mut c = client("m2m_scenarios", Some("Some Other Name"));
+        apply_arbor_pixie_m2m_alias_with(&mut c, Some("m2m_scenarios"));
+        assert_eq!(c.name.as_deref(), Some(ARBOR_PIXIE_ACCOUNT_NAME));
+    }
+
+    #[test]
+    fn arbor_pixie_alias_skips_non_matching_sub() {
+        let mut c = client("kinde_user_42", Some("Real User"));
+        apply_arbor_pixie_m2m_alias_with(&mut c, Some("m2m_scenarios"));
+        assert_eq!(c.name.as_deref(), Some("Real User"));
+    }
+
+    #[test]
+    fn arbor_pixie_alias_no_op_when_env_unset() {
+        let mut c = client("m2m_scenarios", None);
+        apply_arbor_pixie_m2m_alias_with(&mut c, None);
+        assert_eq!(c.name, None);
+    }
 }

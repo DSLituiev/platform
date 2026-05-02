@@ -1,12 +1,17 @@
 <script lang="ts">
-	import { accountName, sendClientMessage, serverState } from '$lib/api.svelte';
+	import {
+		accountName,
+		disambiguatedAccountNames,
+		sendClientMessage,
+		serverState
+	} from '$lib/api.svelte';
 	import { buttonVariants } from '$lib/components/ui/button';
 	import * as Command from '$lib/components/ui/command';
 	import * as Form from '$lib/components/ui/form';
 	import * as Popover from '$lib/components/ui/popover';
 	import { cn } from '$lib/utils';
-	import Check from 'lucide-svelte/icons/check';
-	import ChevronsUpDown from 'lucide-svelte/icons/chevrons-up-down';
+	import Check from '@lucide/svelte/icons/check';
+	import ChevronsUpDown from '@lucide/svelte/icons/chevrons-up-down';
 	import { websocket_api } from 'schema-js';
 	import { tick } from 'svelte';
 	import { protoSuperForm } from './protoSuperForm';
@@ -37,21 +42,38 @@
 		});
 	}
 
+	function accountDropdownStyle(accountId: number | undefined): string | undefined {
+		const color = serverState.accounts.get(accountId ?? 0)?.color?.trim();
+		if (!color || !/^#[0-9a-fA-F]{6}$/.test(color)) {
+			return undefined;
+		}
+		const normalized = color.toLowerCase();
+		return `background-color: ${normalized}33; border-color: ${normalized}80;`;
+	}
+
 	let canActAs = $derived.by(() => {
-		const owned = serverState.portfolios.keys();
+		const owned = [...serverState.portfolios.keys()];
 		// This might not be serverState.userId if you're an admin
-		const currentUser = serverState.portfolios
-			.values()
-			.find((p) => !p.ownerCredits?.length)?.accountId;
-		const users = serverState.accounts
-			.values()
+		const currentUser = [...serverState.portfolios.values()].find(
+			(p) => !p.ownerCredits?.length
+		)?.accountId;
+		const users = [...serverState.accounts.values()]
 			.filter((a) => a.isUser && a.id !== currentUser)
 			.map(({ id }) => id);
-		if (serverState.isAdmin) {
-			return [...owned, ...users];
+		let accounts: number[];
+		if (serverState.isAdmin && serverState.sudoEnabled) {
+			accounts = [...owned, ...users];
+		} else {
+			accounts = owned;
 		}
-		return owned;
+		// Filter to only show accounts in the current universe
+		return accounts.filter((id) => {
+			const account = serverState.accounts.get(id);
+			return (account?.universeId ?? 0) === serverState.currentUniverseId;
+		});
 	});
+
+	let displayNames = $derived(disambiguatedAccountNames(canActAs));
 </script>
 
 <form use:enhance class="flex gap-4">
@@ -62,14 +84,18 @@
 					<Popover.Trigger
 						class={cn(
 							buttonVariants({ variant: 'ghost' }),
-							'flex w-44 justify-between text-lg font-normal'
+							'text-md flex w-44 justify-between px-2 font-normal'
 						)}
+						style={accountDropdownStyle(serverState.actingAs)}
 						role="combobox"
 						bind:ref={popoverTriggerRef}
 						{...props}
 					>
-						<span>
-							Hi <em class="pl-2">{accountName(serverState.actingAs, '')}</em>
+						<span class="act-as-scroll overflow-x-auto">
+							<em
+								>{displayNames.get(serverState.actingAs ?? 0) ??
+									accountName(serverState.actingAs)}</em
+							>
 						</span>
 						<ChevronsUpDown class="ml-2 h-4 w-4 shrink-0 opacity-50" />
 					</Popover.Trigger>
@@ -79,32 +105,46 @@
 			<Popover.Content class="w-44 p-0">
 				<Command.Root>
 					<Command.Input autofocus placeholder="Search accounts..." class="h-9" />
-					<Command.Empty>No other owned accounts</Command.Empty>
-					<Command.Group>
-						{#each canActAs as accountId (accountId)}
-							{#if accountId !== serverState.actingAs}
-								<Command.Item
-									value={accountName(accountId, 'Yourself')}
-									onSelect={() => {
-										$formData.accountId = accountId;
-										closePopoverAndFocusTrigger();
-										form.submit();
-									}}
-								>
-									{accountName(accountId, 'Yourself')}
-									<Check
-										class={cn(
-											'ml-auto h-4 w-4',
-											accountId !== $formData.accountId && 'text-transparent'
-										)}
-									/>
-								</Command.Item>
-							{/if}
-						{/each}
-					</Command.Group>
+					<Command.List>
+						<Command.Empty>No other owned accounts</Command.Empty>
+						<Command.Group>
+							{#each canActAs as accountId (accountId)}
+								{#if accountId !== serverState.actingAs}
+									<Command.Item
+										value={displayNames.get(accountId)}
+										style={accountDropdownStyle(accountId)}
+										onSelect={() => {
+											$formData.accountId = accountId;
+											closePopoverAndFocusTrigger();
+											form.submit();
+										}}
+									>
+										{displayNames.get(accountId)}
+										<Check
+											class={cn(
+												'ml-auto h-4 w-4',
+												accountId !== $formData.accountId && 'text-transparent'
+											)}
+										/>
+									</Command.Item>
+								{/if}
+							{/each}
+						</Command.Group>
+					</Command.List>
 				</Command.Root>
 			</Popover.Content>
 		</Popover.Root>
 		<Form.FieldErrors />
 	</Form.Field>
 </form>
+
+<style>
+	:global(.act-as-scroll) {
+		scrollbar-width: none; /* Firefox & modern browsers */
+		-ms-overflow-style: none; /* IE/Edge */
+	}
+
+	:global(.act-as-scroll)::-webkit-scrollbar {
+		display: none; /* Chrome/Safari */
+	}
+</style>

@@ -1,76 +1,379 @@
 <script lang="ts">
 	import type { MarketData } from '$lib/api.svelte';
-	import { accountName, sendClientMessage } from '$lib/api.svelte';
-	import * as Table from '$lib/components/ui/table';
+	import { getCurrentCohort, sendClientMessage, serverState } from '$lib/api.svelte';
+	import FormattedAccountName from '$lib/components/formattedAccountName.svelte';
+	import MarketGroupInfo from '$lib/components/marketGroupInfo.svelte';
+	import Redeem from '$lib/components/forms/redeem.svelte';
+	import ExerciseOption from '$lib/components/forms/exerciseOption.svelte';
+	import SettleMarket from '$lib/components/forms/settleMarket.svelte';
+	import EditMarketDescription from '$lib/components/forms/editMarketDescription.svelte';
+	import SelectMarket from '$lib/components/selectMarket.svelte';
+	import { Button } from '$lib/components/ui/button';
 	import Toggle from '$lib/components/ui/toggle/toggle.svelte';
-	import { HistoryIcon, LineChartIcon } from 'lucide-svelte';
+	import * as Tooltip from '$lib/components/ui/tooltip';
+	import { useStarredMarkets, usePinnedMarkets } from '$lib/starPinnedMarkets.svelte';
+	import { cn } from '$lib/utils';
+	import { scenarioData } from '$lib/scenarioData.svelte';
+	import { History, LineChart, Pause, Play, Pencil, CircleDot } from '@lucide/svelte/icons';
+	import Star from '@lucide/svelte/icons/star';
+	import Pin from '@lucide/svelte/icons/pin';
+	import { websocket_api } from 'schema-js';
 
 	let {
 		marketData,
 		showChart = $bindable(),
-		displayTransactionIdBindable = $bindable(),
-		maxTransactionId
+		showMyTrades = $bindable(),
+		displayCutoffMsBindable = $bindable(),
+		marketOpenMs,
+		maxCutoffMs,
+		canPlaceOrders = false,
+		isRedeemable = false,
+		isOption = false
 	} = $props<{
 		marketData: MarketData;
 		showChart: boolean;
-		displayTransactionIdBindable: number[];
-		maxTransactionId: number;
+		showMyTrades: boolean;
+		displayCutoffMsBindable: number[];
+		marketOpenMs: number;
+		maxCutoffMs: number;
+		canPlaceOrders?: boolean;
+		isRedeemable?: boolean;
+		isOption?: boolean;
 	}>();
 
 	let marketDefinition = $derived(marketData.definition);
 	let id = $derived(marketDefinition.id);
+	let marketStatus = $derived(
+		marketDefinition.status ?? websocket_api.MarketStatus.MARKET_STATUS_OPEN
+	);
+	let pauseMode = $state(websocket_api.MarketStatus.MARKET_STATUS_PAUSED);
+
+	const { isStarred, toggleStarred } = useStarredMarkets();
+	const { isPinned, togglePinned } = usePinnedMarkets();
+
+	const marketStatusLabel = (status: websocket_api.MarketStatus) => {
+		switch (status) {
+			case websocket_api.MarketStatus.MARKET_STATUS_SEMI_PAUSED:
+				return 'Semi-Paused';
+			case websocket_api.MarketStatus.MARKET_STATUS_PAUSED:
+				return 'Paused';
+			case websocket_api.MarketStatus.MARKET_STATUS_OPEN:
+			default:
+				return 'Open';
+		}
+	};
+
+	const setMarketStatus = (status: websocket_api.MarketStatus) => {
+		sendClientMessage({
+			editMarket: { id, status }
+		});
+	};
+
+	$effect(() => {
+		if (marketStatus === websocket_api.MarketStatus.MARKET_STATUS_SEMI_PAUSED) {
+			pauseMode = websocket_api.MarketStatus.MARKET_STATUS_SEMI_PAUSED;
+		}
+		if (marketStatus === websocket_api.MarketStatus.MARKET_STATUS_PAUSED) {
+			pauseMode = websocket_api.MarketStatus.MARKET_STATUS_PAUSED;
+		}
+	});
+
+	let cohortPrefix = $derived(getCurrentCohort() ? `/${getCurrentCohort()}` : '');
+	let optionInfo = $derived(marketDefinition.option);
+	let underlyingMarketName = $derived(
+		optionInfo?.underlyingMarketId
+			? (serverState.markets.get(optionInfo.underlyingMarketId)?.definition?.name ?? 'Unknown')
+			: null
+	);
+
+	let expirationMs = $derived(
+		optionInfo?.expirationDate?.seconds ? (optionInfo.expirationDate.seconds as number) * 1000 : 0
+	);
+
+	let now = $state(Date.now());
+	$effect(() => {
+		if (!expirationMs) return;
+		const interval = setInterval(() => (now = Date.now()), 1000);
+		return () => clearInterval(interval);
+	});
+
+	let expirationTimeStr = $derived(
+		expirationMs
+			? new Date(expirationMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+			: ''
+	);
+
+	let countdownStr = $derived.by(() => {
+		if (!expirationMs) return '';
+		const diff = expirationMs - now;
+		if (diff <= 0) return 'expired';
+		const totalSec = Math.floor(diff / 1000);
+		const m = Math.floor(totalSec / 60);
+		const s = totalSec % 60;
+		return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+	});
+
+	// Scenario data from shared store
+	let groupName = $derived(
+		marketDefinition.groupId ? serverState.marketGroups.get(marketDefinition.groupId)?.name : null
+	);
+	let clock = $derived(groupName ? scenarioData.clocksByName.get(groupName) : undefined);
+	let myRoll = $derived(
+		groupName ? scenarioData.myRolls.find((r) => r.name === groupName) : undefined
+	);
+	let groupAllRolls = $derived(
+		groupName ? scenarioData.allRolls.filter((r) => r.name === groupName) : []
+	);
+	let isSettled = $derived(Boolean(marketDefinition.closed));
+
+	// Fetch scenario data on mount and when market status changes
+	let prevStatus: number | null = null;
+	$effect(() => {
+		const current = marketStatus;
+		const shouldRefetch = prevStatus !== null && prevStatus !== current;
+		prevStatus = current;
+		if (shouldRefetch) {
+			scenarioData.fetchClocks();
+		}
+	});
+
+	let dataFetched = false;
+	$effect(() => {
+		if (groupName && !dataFetched) {
+			dataFetched = true;
+			scenarioData.fetchClocks();
+			scenarioData.fetchMyRolls();
+			if (serverState.isAdmin) {
+				scenarioData.fetchAllRolls();
+			}
+			scenarioData.startPolling();
+			return () => scenarioData.stopPolling();
+		}
+	});
 </script>
 
-<div class="mb-4 flex justify-between">
-	<div class="mb-4">
-		<h1 class="text-2xl font-bold">{marketDefinition.name}</h1>
-		<p class="mt-2 text-xl">{marketDefinition.description}</p>
-		<p class="mt-2 text-sm italic">
-			Created by {accountName(marketDefinition.ownerId)}
+<div class="flex flex-col gap-3">
+	<div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+		<div class="flex flex-wrap items-center gap-2">
+			<div class="flex items-center gap-2 whitespace-nowrap">
+				<SelectMarket groupId={marketDefinition.groupId} />
+				{#if (serverState.isAdmin && serverState.sudoEnabled) || isPinned(id)}
+					<Button
+						variant="ghost"
+						size="icon"
+						class="h-9 w-9 text-muted-foreground hover:bg-transparent focus:bg-transparent"
+						onclick={() => togglePinned(id)}
+						disabled={!(serverState.isAdmin && serverState.sudoEnabled)}
+					>
+						<Pin
+							class={cn(
+								'h-5 w-5',
+								isPinned(id)
+									? serverState.isAdmin && serverState.sudoEnabled
+										? 'fill-blue-400 text-blue-400 hover:fill-blue-300 hover:text-blue-300'
+										: 'fill-gray-400 text-gray-400'
+									: 'hover:fill-yellow-100 hover:text-primary'
+							)}
+						/>
+						<span class="sr-only">Pin Market</span>
+					</Button>
+				{/if}
+				<Button
+					variant="ghost"
+					size="icon"
+					class="h-9 w-9 text-muted-foreground hover:bg-transparent focus:bg-transparent"
+					onclick={() => toggleStarred(id)}
+				>
+					<Star
+						class={cn(
+							'h-5 w-5',
+							isStarred(id)
+								? 'fill-yellow-400 text-yellow-400 hover:fill-yellow-300 hover:text-yellow-300'
+								: 'hover:fill-yellow-100 hover:text-primary'
+						)}
+					/>
+					<span class="sr-only">Star Market</span>
+				</Button>
+			</div>
+			<MarketGroupInfo {clock} {myRoll} allRolls={groupAllRolls} settled={isSettled} />
+		</div>
+		<div class="flex flex-wrap items-center gap-2 md:justify-end">
+			{#if marketDefinition.closed}
+				<p class="text-sm text-muted-foreground">
+					Settle Price: {marketDefinition.closed.settlePrice}
+				</p>
+			{/if}
+			{#if isRedeemable}
+				<div class="mr-4">
+					<Redeem marketId={id} disabled={!canPlaceOrders} />
+				</div>
+			{/if}
+			{#if isOption && optionInfo}
+				<div
+					class="flex h-10 items-center gap-1.5 whitespace-nowrap rounded-md border border-border bg-muted/50 px-2.5 text-sm font-medium"
+				>
+					{optionInfo.isCall ? 'Call' : 'Put'} on
+					<a
+						href="{cohortPrefix}/market/{optionInfo.underlyingMarketId}"
+						class="flex h-7 items-center rounded border border-border bg-background px-2 transition-colors hover:bg-accent"
+					>
+						{underlyingMarketName}
+					</a>
+					strike {optionInfo.strikePrice}
+					{#if expirationMs}
+						exp {expirationTimeStr}
+						<span
+							class="rounded bg-background px-1.5 py-0.5 font-mono text-xs {countdownStr ===
+							'expired'
+								? 'text-destructive'
+								: 'text-muted-foreground'}"
+						>
+							{countdownStr}
+						</span>
+					{/if}
+				</div>
+				<div class="mr-4">
+					<ExerciseOption marketId={id} disabled={!canPlaceOrders} />
+				</div>
+			{/if}
+			{#if serverState.isAdmin && serverState.sudoEnabled && !marketDefinition.closed}
+				<div class="flex items-center gap-2">
+					<span class="text-xs font-medium text-muted-foreground">
+						{marketStatusLabel(marketStatus)}
+					</span>
+					<Button
+						variant="outline"
+						size="sm"
+						class={cn(
+							'h-9',
+							marketStatus === websocket_api.MarketStatus.MARKET_STATUS_PAUSED
+								? 'border-amber-400 text-amber-600 hover:text-amber-600'
+								: marketStatus === websocket_api.MarketStatus.MARKET_STATUS_SEMI_PAUSED
+									? 'border-yellow-500 text-yellow-600 hover:text-yellow-600'
+									: 'border-muted-foreground/30'
+						)}
+						onclick={() =>
+							setMarketStatus(
+								marketStatus === websocket_api.MarketStatus.MARKET_STATUS_OPEN
+									? pauseMode
+									: websocket_api.MarketStatus.MARKET_STATUS_OPEN
+							)}
+					>
+						{#if marketStatus === websocket_api.MarketStatus.MARKET_STATUS_OPEN}
+							<Pause class="h-4 w-4" />
+						{:else}
+							<Play class="h-4 w-4" />
+						{/if}
+					</Button>
+					<Tooltip.Root>
+						<Tooltip.Trigger>
+							{#snippet child({ props })}
+								<button
+									{...props}
+									type="button"
+									role="switch"
+									aria-checked={pauseMode === websocket_api.MarketStatus.MARKET_STATUS_PAUSED}
+									class={cn(
+										'relative inline-flex h-6 w-12 items-center rounded-full border transition',
+										'border-muted-foreground/30 bg-muted/60'
+									)}
+									onclick={() => {
+										const nextMode =
+											pauseMode === websocket_api.MarketStatus.MARKET_STATUS_PAUSED
+												? websocket_api.MarketStatus.MARKET_STATUS_SEMI_PAUSED
+												: websocket_api.MarketStatus.MARKET_STATUS_PAUSED;
+										if (marketStatus !== websocket_api.MarketStatus.MARKET_STATUS_OPEN) {
+											// When paused, only send to server; $effect will update pauseMode when server responds
+											setMarketStatus(nextMode);
+										} else {
+											// When open, just update local preference for next pause
+											pauseMode = nextMode;
+										}
+									}}
+								>
+									<span
+										class={cn(
+											'inline-block h-5 w-5 rounded-full bg-white shadow transition',
+											pauseMode === websocket_api.MarketStatus.MARKET_STATUS_PAUSED
+												? 'translate-x-6'
+												: 'translate-x-1'
+										)}
+									></span>
+								</button>
+							{/snippet}
+						</Tooltip.Trigger>
+						<Tooltip.Content>
+							{pauseMode === websocket_api.MarketStatus.MARKET_STATUS_PAUSED
+								? 'No new orders and no cancels'
+								: 'No new orders'}
+						</Tooltip.Content>
+					</Tooltip.Root>
+					<span class="inline-block w-20 text-left text-xs text-muted-foreground">
+						{pauseMode === websocket_api.MarketStatus.MARKET_STATUS_PAUSED
+							? 'Paused'
+							: 'Semi-Paused'}
+					</span>
+				</div>
+			{/if}
+			{#if (marketDefinition.ownerId === serverState.userId || (serverState.isAdmin && serverState.sudoEnabled)) && !marketDefinition.closed && !isOption}
+				<SettleMarket
+					{id}
+					name={marketDefinition.name}
+					minSettlement={marketDefinition.minSettlement}
+					maxSettlement={marketDefinition.maxSettlement}
+				/>
+			{/if}
+			<Toggle
+				onclick={() => {
+					if (displayCutoffMsBindable.length) {
+						displayCutoffMsBindable = [];
+					} else {
+						displayCutoffMsBindable = [marketOpenMs, maxCutoffMs];
+						if (!marketData.hasFullOrderHistory) {
+							sendClientMessage({ getFullOrderHistory: { marketId: id } });
+						}
+					}
+				}}
+				variant="outline"
+			>
+				<History />
+			</Toggle>
+			<Tooltip.Root>
+				<Tooltip.Trigger>
+					{#snippet child({ props })}
+						<Toggle {...props} bind:pressed={showMyTrades} variant="outline">
+							<CircleDot />
+						</Toggle>
+					{/snippet}
+				</Tooltip.Trigger>
+				<Tooltip.Content>Show my trades on chart</Tooltip.Content>
+			</Tooltip.Root>
+			<Toggle bind:pressed={showChart} variant="outline" class="hidden md:block">
+				<LineChart />
+			</Toggle>
+		</div>
+	</div>
+	<div class="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+		<div class="flex items-center gap-1 text-sm">
+			<p>
+				Created by <FormattedAccountName accountId={marketDefinition.ownerId} />
+				{#if marketDefinition.description}
+					<span class="text-muted-foreground"> / {marketDefinition.description}</span>
+				{/if}
+			</p>
+			{#if (serverState.isAdmin && serverState.sudoEnabled) || marketDefinition.ownerId === serverState.userId}
+				<EditMarketDescription
+					marketId={id}
+					currentDescription={marketDefinition.description ?? ''}
+					currentStatus={marketStatus}
+					class="h-6 w-6 p-0 text-muted-foreground hover:text-foreground"
+				>
+					<Pencil class="h-3 w-3" />
+				</EditMarketDescription>
+			{/if}
+		</div>
+		<p class="text-sm text-muted-foreground">
+			Settles {marketDefinition.minSettlement} - {marketDefinition.maxSettlement}
 		</p>
 	</div>
-	<div>
-		<Table.Root class="w-auto text-center font-bold">
-			<Table.Header>
-				<Table.Row>
-					<Table.Head>
-						<Toggle
-							onclick={() => {
-								if (displayTransactionIdBindable.length) {
-									displayTransactionIdBindable = [];
-								} else {
-									displayTransactionIdBindable = [maxTransactionId];
-									if (!marketData.hasFullOrderHistory) {
-										sendClientMessage({ getFullOrderHistory: { marketId: id } });
-									}
-								}
-							}}
-							variant="outline"
-						>
-							<HistoryIcon />
-						</Toggle>
-					</Table.Head>
-					<Table.Head>
-						<Toggle bind:pressed={showChart} variant="outline">
-							<LineChartIcon />
-						</Toggle>
-					</Table.Head>
-					<Table.Head class="text-center">Min Settlement</Table.Head>
-					<Table.Head class="text-center">Max Settlement</Table.Head>
-				</Table.Row>
-			</Table.Header>
-			<Table.Body>
-				<Table.Row>
-					<Table.Cell class="p-2"></Table.Cell>
-					<Table.Cell class="p-2"></Table.Cell>
-					<Table.Cell class="p-2">{marketDefinition.minSettlement}</Table.Cell>
-					<Table.Cell class="p-2">{marketDefinition.maxSettlement}</Table.Cell>
-				</Table.Row>
-			</Table.Body>
-		</Table.Root>
-	</div>
 </div>
-
-{#if marketDefinition.closed}
-	<p>Market settled to <em>{marketDefinition.closed.settlePrice}</em></p>
-{/if}

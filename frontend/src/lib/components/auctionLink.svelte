@@ -1,0 +1,84 @@
+<!-- AuctionLink.svelte -->
+<script lang="ts">
+	import { accountName } from '$lib/api.svelte';
+	import Star from '@lucide/svelte/icons/star';
+	import logo from '$lib/assets/logo.svg';
+	import { websocket_api } from 'schema-js';
+	import { createEventDispatcher } from 'svelte';
+	import { PUBLIC_SERVER_URL } from '$env/static/public';
+
+	interface Props {
+		auction: websocket_api.IAuction;
+		splitIndicator?: boolean;
+	}
+	let { auction, splitIndicator = false }: Props = $props();
+	let closed = $derived(auction.closed);
+	let isSplit = $derived((auction.buyers?.length ?? 0) > 1);
+
+	let starred = $state(false);
+
+	$effect(() => {
+		if (auction?.id) {
+			starred = localStorage.getItem(`is_auction_starred_${auction.id}`) === 'true';
+		}
+	});
+
+	function handleStarClick() {
+		localStorage.setItem(`is_starred_${auction.id}`, !starred ? 'true' : 'false');
+		starred = !starred;
+	}
+
+	let isHovering = $state(false);
+	const dispatch = createEventDispatcher();
+</script>
+
+<div
+	role="button"
+	tabindex="0"
+	onclick={() => dispatch('open', { auction })}
+	onkeydown={(e) => e.key === 'Enter' && dispatch('open', { auction })}
+	class:order-2={!closed && starred}
+	class:order-3={!closed && !starred}
+	class:order-5={closed && starred}
+	class:order-6={closed && !starred}
+	class:opacity-50={closed}
+	class:grayscale={closed}
+	class="flex cursor-pointer flex-col items-center gap-2 rounded-lg border bg-card p-4 text-center shadow transition hover:shadow-md"
+>
+	<!-- Star button -->
+	<div class="z-10 -mr-2 -mt-2 self-end">
+		<button
+			onclick={(e) => {
+				e.stopPropagation();
+				handleStarClick();
+			}}
+			onmouseenter={() => (isHovering = true)}
+			onmouseleave={() => (isHovering = false)}
+			class="rounded-full p-1 focus:outline-none"
+			aria-label={starred ? 'Unstar market' : 'Star market'}
+		>
+			<Star
+				color={starred || isHovering ? 'gold' : 'slategray'}
+				fill={starred ? (isHovering ? 'none' : 'gold') : 'none'}
+				size="20"
+			/>
+		</button>
+	</div>
+
+	<!-- Title and Creator -->
+	<h2 class="text-lg font-bold text-card-foreground">
+		{auction.name?.replace('[AUCTION] ', '')}{#if splitIndicator && isSplit}<span
+				title="Split auction with multiple buyers">*</span
+			>{/if}
+	</h2>
+	<p class="text-sm text-muted-foreground">{accountName(auction.ownerId) ?? 'Unknown'}</p>
+
+	<!-- Image -->
+	<img
+		src={auction.imageUrl == '/images/'
+			? logo
+			: PUBLIC_SERVER_URL.replace('wss', 'https').replace('ws', 'http') + auction.imageUrl}
+		alt={auction.name?.replace('[AUCTION] ', '') ?? 'Auction item'}
+		class="h-60 w-60 rounded object-cover"
+	/>
+</div>

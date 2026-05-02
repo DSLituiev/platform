@@ -1,94 +1,127 @@
-<script>
-	import { serverState } from '$lib/api.svelte';
-	import * as Table from '$lib/components/ui/table';
-	import MarketName from './marketName.svelte';
+<script lang="ts">
+	import { goto } from '$app/navigation';
+	import { browser } from '$app/environment';
+	import { fetchCohorts, type CohortInfo } from '$lib/cohortApi';
+	import { kinde } from '$lib/auth.svelte';
+	import { onMount } from 'svelte';
+
+	let cohorts = $state<CohortInfo[]>([]);
+	let loading = $state(true);
+	let error = $state<string | null>(null);
+
+	const landingPath = (cohort: CohortInfo) =>
+		cohort.auctions_enabled ? `/${cohort.name}/auction` : `/${cohort.name}/market`;
+
+	onMount(async () => {
+		// If we stashed a deep-link before bouncing through Kinde login, honor it
+		// before falling back to the cohort-list logic. The cohort layout's load
+		// will validate the path and 404 if it's bogus.
+		if (browser) {
+			const stashed = localStorage.getItem('postLoginRedirect');
+			if (stashed && stashed !== '/') {
+				localStorage.removeItem('postLoginRedirect');
+				goto(stashed, { replaceState: true });
+				return;
+			}
+		}
+
+		try {
+			const response = await fetchCohorts();
+			cohorts = response.cohorts;
+
+			// Auto-redirect if user has exactly 1 cohort
+			if (cohorts.length === 1) {
+				goto(landingPath(cohorts[0]), { replaceState: true });
+				return;
+			}
+
+			// Check localStorage for last-used cohort
+			if (browser) {
+				const lastCohortName = localStorage.getItem('lastCohort');
+				const lastCohort = lastCohortName
+					? cohorts.find((c) => c.name === lastCohortName)
+					: undefined;
+				if (lastCohort) {
+					goto(landingPath(lastCohort), { replaceState: true });
+					return;
+				}
+			}
+		} catch (e) {
+			error = e instanceof Error ? e.message : 'Failed to load cohorts';
+		} finally {
+			loading = false;
+		}
+	});
+
+	function selectCohort(cohort: CohortInfo) {
+		if (browser) {
+			localStorage.setItem('lastCohort', cohort.name);
+		}
+		goto(landingPath(cohort));
+	}
 </script>
 
-<div class="pt-8">
-	<h1 class="mb-8 text-xl font-bold">Welcome to Trading Bootcamp!</h1>
-	{#if serverState.portfolio}
-		<div class="flex flex-col gap-4">
-			<p class="text-lg">
-				Total Balance: 📎 {new Intl.NumberFormat(undefined, {
-					maximumFractionDigits: 4
-				}).format(serverState.portfolio.totalBalance ?? 0)}
-			</p>
-			<p class="text-lg">
-				Available Balance: 📎 {new Intl.NumberFormat(undefined, {
-					maximumFractionDigits: 4
-				}).format(serverState.portfolio.availableBalance ?? 0)}
-			</p>
-			{#if serverState.portfolio.marketExposures?.length}
-				<p class="text-lg">Exposures:</p>
-				<Table.Root class="hidden text-center md:block">
-					<Table.Header>
-						<Table.Row>
-							<Table.Head class="text-center">Market</Table.Head>
-							<Table.Head class="text-center">Position</Table.Head>
-							<Table.Head class="text-center">Total Bid Size</Table.Head>
-							<Table.Head class="text-center">Total Offer Size</Table.Head>
-						</Table.Row>
-					</Table.Header>
-					<Table.Body>
-						{#each serverState.portfolio.marketExposures as { marketId, position, totalBidSize, totalOfferSize } (marketId)}
-							<Table.Row>
-								<Table.Cell>
-									<MarketName market={serverState.markets.get(marketId)?.definition} />
-								</Table.Cell>
-								<Table.Cell>
-									{new Intl.NumberFormat(undefined, {
-										maximumFractionDigits: 2
-									}).format(position ?? 0)}
-								</Table.Cell>
-								<Table.Cell>
-									{new Intl.NumberFormat(undefined, {
-										maximumFractionDigits: 2
-									}).format(totalBidSize ?? 0)}
-								</Table.Cell>
-								<Table.Cell>
-									{new Intl.NumberFormat(undefined, {
-										maximumFractionDigits: 2
-									}).format(totalOfferSize ?? 0)}
-								</Table.Cell>
-							</Table.Row>
-						{/each}
-					</Table.Body>
-				</Table.Root>
-				<div class="md:hidden">
-					{#each serverState.portfolio.marketExposures as { marketId, position, totalBidSize, totalOfferSize } (marketId)}
-						<div class="flex flex-col gap-4 border-b-2">
-							<div>
-								<span class="font-bold">Market:</span>
-								<span><MarketName market={serverState.markets.get(marketId)?.definition} /></span>
-							</div>
-							<div>
-								<span class="font-bold">Position:</span>
-								<span
-									>{new Intl.NumberFormat(undefined, {
-										maximumFractionDigits: 2
-									}).format(position ?? 0)}</span
-								>
-							</div>
-							<div>
-								<span class="font-bold">Total Bid Size:</span>
-								<span
-									>{new Intl.NumberFormat(undefined, {
-										maximumFractionDigits: 2
-									}).format(totalBidSize ?? 0)}</span
-								>
-							</div>
-							<div>
-								<span class="font-bold">Total Offer Size:</span>
-								<span
-									>{new Intl.NumberFormat(undefined, {
-										maximumFractionDigits: 2
-									}).format(totalOfferSize ?? 0)}</span
-								>
-							</div>
-						</div>
-					{/each}
-				</div>
-			{/if}
+{#if loading}
+	<div class="flex min-h-screen items-center justify-center">
+		<div
+			class="h-8 w-8 animate-spin rounded-full border-4 border-primary border-t-transparent"
+		></div>
+	</div>
+{:else if error}
+	<div class="flex min-h-screen items-center justify-center">
+		<div class="text-center">
+			<p class="text-lg text-muted-foreground">{error}</p>
+			<button
+				class="mt-4 rounded-md bg-primary px-4 py-2 text-primary-foreground hover:bg-primary/90"
+				onclick={() => window.location.reload()}
+			>
+				Retry
+			</button>
 		</div>
-	{/if}
-</div>
+	</div>
+{:else if cohorts.length === 0}
+	<div class="flex min-h-screen items-center justify-center">
+		<div class="text-center">
+			<p class="text-lg text-muted-foreground">Your account isn't authorized for any cohort yet.</p>
+			<p class="mt-2 text-sm text-muted-foreground">Contact an administrator to get access.</p>
+			<button
+				class="mt-4 rounded-md border px-4 py-2 text-sm hover:bg-muted"
+				onclick={() => kinde.logout()}
+			>
+				Log Out
+			</button>
+		</div>
+	</div>
+{:else}
+	<div class="flex min-h-screen items-center justify-center p-8">
+		<div class="w-full max-w-2xl">
+			<div class="mb-8 flex items-center justify-between">
+				<h1 class="text-3xl font-bold">Select a Cohort</h1>
+				<button
+					class="rounded-md border px-4 py-2 text-sm hover:bg-muted"
+					onclick={() => kinde.logout()}
+				>
+					Log Out
+				</button>
+			</div>
+			<div class="grid gap-4 md:grid-cols-2">
+				{#each cohorts as cohort}
+					<button
+						class="rounded-lg border bg-card p-6 text-left transition-colors hover:bg-muted"
+						onclick={() => selectCohort(cohort)}
+					>
+						<h2 class="text-xl font-semibold">{cohort.display_name}</h2>
+						<p class="mt-1 text-sm text-muted-foreground">{cohort.name}</p>
+						{#if cohort.is_read_only}
+							<span
+								class="mt-2 inline-block rounded-full bg-amber-500/20 px-2 py-0.5 text-xs text-amber-600 dark:text-amber-400"
+							>
+								Read-only
+							</span>
+						{/if}
+					</button>
+				{/each}
+			</div>
+		</div>
+	</div>
+{/if}

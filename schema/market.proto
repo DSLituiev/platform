@@ -2,21 +2,35 @@ syntax = "proto3";
 package websocket_api;
 
 import "google/protobuf/timestamp.proto";
-import "transaction.proto";
 import "redeemable.proto";
+import "option-info.proto";
+
+enum MarketStatus {
+  MARKET_STATUS_OPEN = 0;
+  MARKET_STATUS_SEMI_PAUSED = 1;
+  MARKET_STATUS_PAUSED = 2;
+}
 
 message Market {
   int64 id = 1;
   string name = 2;
   string description = 3;
   int64 owner_id = 10;
-  Transaction transaction = 5;
+  int64 transaction_id = 12;
+  google.protobuf.Timestamp transaction_timestamp = 13;
   double min_settlement = 6;
   double max_settlement = 7;
   repeated Redeemable redeemable_for = 4;
   double redeem_fee = 11;
+  repeated int64 visible_to = 14;  // List of account IDs that can see this market. If empty, visible to all.
+  bool pinned = 15;
+  int64 type_id = 16;
+  int64 group_id = 17;
+  MarketStatus status = 18;
+  int64 universe_id = 19;
+  OptionInfo option = 20;
 
-  oneof status {
+  oneof market_state {
     Open open = 8;
     Closed closed = 9;
   }
@@ -25,5 +39,6 @@ message Market {
   message Closed {
     double settle_price = 1;
     int64 transaction_id = 2;
+    google.protobuf.Timestamp transaction_timestamp = 3;
   }
 }

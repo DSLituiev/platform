@@ -1,45 +1,91 @@
 import { PUBLIC_SERVER_URL } from '$env/static/public';
+import { browser } from '$app/environment';
+import { goto } from '$app/navigation';
 import ReconnectingWebSocket from 'reconnecting-websocket';
-import { google, websocket_api } from 'schema-js';
+import { websocket_api } from 'schema-js';
 import { toast } from 'svelte-sonner';
 import { SvelteMap } from 'svelte/reactivity';
 import { kinde } from './auth.svelte';
 import { notifyUser } from './notifications';
+// const originalConsoleLog = console.log;
 
-const socket = new ReconnectingWebSocket(PUBLIC_SERVER_URL);
-socket.binaryType = 'arraybuffer';
+// // Override console.log
+// console.log = function (...args) {
+// 	// Get the stack trace
+// 	// Creating a new Error object captures the current stack trace
+// 	const stack = new Error().stack;
+
+// 	// You might want to clean up the stack trace string a bit,
+// 	// for example, remove the first line which is often the Error message itself.
+// 	const stackLines = stack.split('\n');
+// 	// Remove the first line (e.g., "Error") and potentially the override function's frame
+// 	const cleanedStack = stackLines.slice(2).join('\n'); // Adjust slice number if needed based on environment
+
+// 	// Log the original message followed by the cleaned stack trace
+// 	originalConsoleLog.apply(console, [...args, '\n', 'Stack Trace:', cleanedStack]);
+
+// 	// Alternatively, use console.trace() which might format better in some consoles:
+// 	// originalConsoleLog.apply(console, args);
+// 	// console.trace('Logged from:'); // This adds a stack trace at the point this line is called
+// 	// which might be slightly different than the *original* call site
+// 	// depending on how the override function affects the stack.
+// 	// Using new Error().stack is generally more reliable for the original call site.
+// };
+
+let socket: ReconnectingWebSocket | null = null;
+let currentCohort: string | null = null;
 
 export class MarketData {
 	definition: websocket_api.IMarket = $state({});
 	orders: websocket_api.IOrder[] = $state([]);
 	trades: websocket_api.ITrade[] = $state([]);
+	redemptions: websocket_api.IRedeemed[] = $state([]);
 	hasFullOrderHistory: boolean = $state(false);
 	hasFullTradeHistory: boolean = $state(false);
+	statusChanges: websocket_api.IMarketStatusChange[] = $state([]);
 }
-
-const insertTransaction = (transaction: websocket_api.ITransaction | null | undefined) => {
-	if (transaction?.id && transaction.timestamp) {
-		serverState.transactions.set(transaction.id, transaction.timestamp);
-		serverState.lastKnownTransactionId = Math.max(
-			serverState.lastKnownTransactionId,
-			transaction.id
-		);
-	}
-};
 
 export const serverState = $state({
 	stale: true,
 	userId: undefined as number | undefined,
 	actingAs: undefined as number | undefined,
+	effectiveUserId: undefined as number | undefined,
+	currentUniverseId: 0 as number,
 	isAdmin: false,
+	sudoEnabled: false,
 	portfolio: undefined as websocket_api.IPortfolio | undefined,
 	portfolios: new SvelteMap<number, websocket_api.IPortfolio>(),
 	transfers: [] as websocket_api.ITransfer[],
 	accounts: new SvelteMap<number, websocket_api.IAccount>(),
 	markets: new SvelteMap<number, MarketData>(),
-	transactions: new SvelteMap<number, google.protobuf.ITimestamp>(),
-	lastKnownTransactionId: 0
+	marketTypes: new SvelteMap<number, websocket_api.IMarketType>(),
+	marketGroups: new SvelteMap<number, websocket_api.IMarketGroup>(),
+	auctions: new SvelteMap<number, websocket_api.IAuction>(),
+	universes: new SvelteMap<number, websocket_api.IUniverse>(),
+	tradedMarketIds: new SvelteMap<number, Set<number>>(),
+	optionContracts: new SvelteMap<number, websocket_api.IOptionContract[]>(),
+	lastKnownTransactionId: 0,
+	arborPixieAccountId: undefined as number | undefined,
+	isCohortMember: true,
+	auctionEnabled: false,
+	lastCreatedRedeemCode: null as null | {
+		code: string;
+		amount: number;
+		expiresAt?: number;
+	},
+	lastClaimedRedeemCode: null as null | { code: string; amount: number }
 });
+
+export const hasArborPixieTransfer = () => {
+	if (!serverState.arborPixieAccountId) {
+		return true; // Just to avoid weird behavior while connecting
+	}
+	return serverState.transfers.some(
+		(t) =>
+			t.fromAccountId === serverState.arborPixieAccountId &&
+			t.toAccountId === (serverState.isAdmin ? serverState.actingAs : serverState.userId)
+	);
+};
 
 let resolveConnectionToast: ((value: unknown) => void) | undefined;
 const startConnectionToast = () => {
@@ -63,7 +109,13 @@ let messageQueue: websocket_api.IClientMessage[] = [];
 let hasAuthenticated = false;
 
 export const sendClientMessage = (msg: websocket_api.IClientMessage) => {
+	if (!socket) {
+		messageQueue.push(msg);
+		return;
+	}
 	if (hasAuthenticated || 'authenticate' in msg) {
+		const msgType = Object.keys(msg).find((key) => msg[key as keyof typeof msg]);
+		console.log(`sending ${msgType} message`, msg[msgType as keyof typeof msg]);
 		const data = websocket_api.ClientMessage.encode(msg).finish();
 		socket.send(data);
 		hasAuthenticated = true;
@@ -76,20 +128,75 @@ export const sendClientMessage = (msg: websocket_api.IClientMessage) => {
 	}
 };
 
-export const accountName = (accountId: number | null | undefined, me: string = 'You') => {
+export const isAltAccount = (accountId: number | null | undefined): boolean => {
 	const account = serverState.accounts.get(accountId ?? 0);
-	const prefix = account?.isUser ? '' : 'alt:';
-	return accountId === serverState.userId && me
-		? me
-		: `${prefix}${account?.name || 'Unnamed account'}`;
+	return account ? !account.isUser : false;
+};
+
+export const accountName = (
+	accountId: number | null | undefined,
+	me?: string,
+	options?: { raw?: boolean }
+) => {
+	const account = serverState.accounts.get(accountId ?? 0);
+	const rawName = account?.name || 'Unnamed account';
+	// Hide everything before __ (e.g., "UniverseName__AccountName" -> "AccountName")
+	const formattedName = options?.raw ? rawName : rawName.replace(/^.*__/, '');
+	return accountId === serverState.userId && me ? me : formattedName;
+};
+
+/**
+ * Returns a Map of accountId -> display name, using short names when unique
+ * and falling back to raw (full) names or raw + ID when there are duplicates.
+ */
+export const disambiguatedAccountNames = (
+	accountIds: number[],
+	me?: string
+): Map<number, string> => {
+	const result = new Map<number, string>();
+
+	const shortNames = new Map<number, string>();
+	const shortNameCounts = new Map<string, number>();
+	for (const id of accountIds) {
+		const short = accountName(id, me);
+		shortNames.set(id, short);
+		shortNameCounts.set(short, (shortNameCounts.get(short) ?? 0) + 1);
+	}
+
+	const rawNameCounts = new Map<string, number>();
+	const needsDisambiguation = new Set<number>();
+	for (const id of accountIds) {
+		const short = shortNames.get(id)!;
+		if ((shortNameCounts.get(short) ?? 0) > 1) {
+			needsDisambiguation.add(id);
+			const raw = accountName(id, me, { raw: true });
+			rawNameCounts.set(raw, (rawNameCounts.get(raw) ?? 0) + 1);
+		}
+	}
+
+	for (const id of accountIds) {
+		if (!needsDisambiguation.has(id)) {
+			result.set(id, shortNames.get(id)!);
+		} else {
+			const raw = accountName(id, me, { raw: true });
+			const fullName = raw.replace(/__/g, ' ');
+			if ((rawNameCounts.get(raw) ?? 0) > 1) {
+				result.set(id, `${fullName} (#${id})`);
+			} else {
+				result.set(id, fullName);
+			}
+		}
+	}
+
+	return result;
 };
 
 const authenticate = async () => {
+	console.log('authenticating...');
 	startConnectionToast();
 	const accessToken = await kinde.getToken();
 	const idToken = await kinde.getIdToken();
-	const isAdmin = await kinde.isAdmin();
-	serverState.isAdmin = isAdmin;
+
 	if (!accessToken) {
 		console.log('no access token');
 		return;
@@ -98,22 +205,73 @@ const authenticate = async () => {
 		console.log('no id token');
 		return;
 	}
-	const actAs = Number(localStorage.getItem('actAs'));
+	const actAsKey = currentCohort ? `${currentCohort}:actAs` : 'actAs';
+	const stored = Number(localStorage.getItem(actAsKey));
+	const actAs = stored > 0 ? stored : undefined;
 	const authenticate = {
 		jwt: accessToken,
 		idJwt: idToken,
-		actAs: Number.isNaN(actAs) ? undefined : actAs
+		actAs
 	};
 	console.log('Auth info:', authenticate);
 	sendClientMessage({ authenticate });
 };
-socket.onopen = authenticate;
 
-socket.onclose = () => {
+const resetServerState = () => {
 	serverState.stale = true;
+	serverState.userId = undefined;
+	serverState.actingAs = undefined;
+	serverState.currentUniverseId = 0;
+	serverState.sudoEnabled = false;
+	serverState.portfolio = undefined;
+	serverState.portfolios.clear();
+	serverState.transfers = [];
+	serverState.accounts.clear();
+	serverState.markets.clear();
+	serverState.marketTypes.clear();
+	serverState.marketGroups.clear();
+	serverState.auctions.clear();
+	serverState.universes.clear();
+	serverState.lastKnownTransactionId = 0;
+	serverState.arborPixieAccountId = undefined;
+	serverState.isCohortMember = true;
+	serverState.auctionEnabled = false;
+	serverState.lastCreatedRedeemCode = null;
+	serverState.lastClaimedRedeemCode = null;
+	hasAuthenticated = false;
+	messageQueue = [];
 };
 
-socket.onmessage = (event: MessageEvent) => {
+export const connectToCohort = (cohortName: string) => {
+	if (currentCohort === cohortName && socket) return;
+	if (socket) {
+		socket.close();
+		resetServerState();
+	}
+	currentCohort = cohortName;
+	const wsUrl = `${PUBLIC_SERVER_URL}/ws/${cohortName}`;
+	console.log('Connecting to', wsUrl);
+	socket = new ReconnectingWebSocket(wsUrl);
+	socket.binaryType = 'arraybuffer';
+	socket.onopen = authenticate;
+	socket.onclose = () => {
+		serverState.stale = true;
+	};
+	socket.onmessage = handleMessage;
+};
+
+export const disconnectFromCohort = () => {
+	if (socket) {
+		socket.close();
+		socket = null;
+	}
+	currentCohort = null;
+	resetServerState();
+};
+
+export const getCurrentCohort = () => currentCohort;
+
+const handleMessage = (event: MessageEvent) => {
 	const data = event.data;
 	const msg = websocket_api.ServerMessage.decode(new Uint8Array(data));
 
@@ -121,6 +279,27 @@ socket.onmessage = (event: MessageEvent) => {
 
 	if (msg.authenticated) {
 		serverState.userId = msg.authenticated.accountId;
+		serverState.isCohortMember = msg.authenticated.isCohortMember ?? true;
+		serverState.auctionEnabled = msg.authenticated.auctionEnabled ?? false;
+		serverState.isAdmin = msg.authenticated.isAdmin ?? false;
+		serverState.sudoEnabled = false;
+	}
+
+	if (msg.redeemCodeCreated) {
+		const created = msg.redeemCodeCreated;
+		serverState.lastCreatedRedeemCode = {
+			code: created.code ?? '',
+			amount: created.amount ?? 0,
+			expiresAt: created.expiresAt?.seconds ? Number(created.expiresAt.seconds) : undefined
+		};
+	}
+
+	if (msg.redeemCodeClaimed) {
+		const claimed = msg.redeemCodeClaimed;
+		serverState.lastClaimedRedeemCode = {
+			code: claimed.code ?? '',
+			amount: claimed.amount ?? 0
+		};
 	}
 
 	if (msg.actingAs) {
@@ -130,25 +309,25 @@ socket.onmessage = (event: MessageEvent) => {
 			resolveConnectionToast = undefined;
 		}
 		if (msg.actingAs.accountId) {
-			localStorage.setItem('actAs', msg.actingAs.accountId.toString());
+			const actAsKey = currentCohort ? `${currentCohort}:actAs` : 'actAs';
+			localStorage.setItem(actAsKey, msg.actingAs.accountId.toString());
 		}
 		serverState.actingAs = msg.actingAs.accountId;
-		serverState.portfolio = serverState.portfolios.get(msg.actingAs.accountId);
-	}
-
-	if (msg.transactions) {
-		const transactions = msg.transactions.transactions || [];
-		serverState.transactions.clear();
-		for (const t of transactions) {
-			if (t.id && t.timestamp) {
-				serverState.transactions.set(t.id, t.timestamp);
+		serverState.effectiveUserId = msg.actingAs.userId || serverState.userId;
+		const newUniverseId = msg.actingAs.universeId ?? 0;
+		// Clear markets when universe changes - server will resend the correct ones
+		if (newUniverseId !== serverState.currentUniverseId) {
+			serverState.markets.clear();
+			// Redirect to /market if on a specific market page (the market may not exist in the new universe)
+			if (browser && window.location.pathname.match(/\/market\/\d+/)) {
+				goto(currentCohort ? `/${currentCohort}/market` : '/market');
 			}
 		}
-		// transactions always arrive sorted
-		serverState.lastKnownTransactionId = Math.max(
-			serverState.lastKnownTransactionId,
-			transactions[transactions.length - 1]?.id ?? 0
-		);
+		serverState.currentUniverseId = newUniverseId;
+		serverState.portfolio = serverState.portfolios.get(msg.actingAs.accountId);
+		if (serverState.isAdmin && localStorage.getItem('sudoEnabled') === 'true') {
+			sendClientMessage({ setSudo: { enabled: true } });
+		}
 	}
 
 	if (msg.portfolioUpdated) {
@@ -161,9 +340,16 @@ socket.onmessage = (event: MessageEvent) => {
 	if (msg.portfolios) {
 		if (!msg.portfolios.areNewOwnerships) {
 			serverState.portfolios.clear();
+			serverState.tradedMarketIds.clear();
 		}
 		for (const p of msg.portfolios.portfolios || []) {
 			serverState.portfolios.set(p.accountId, p);
+			if (p.tradedMarketIds?.length) {
+				serverState.tradedMarketIds.set(
+					p.accountId as number,
+					new Set(p.tradedMarketIds.map(Number))
+				);
+			}
 			if (p.accountId == serverState.actingAs) {
 				serverState.portfolio = p;
 			}
@@ -172,7 +358,10 @@ socket.onmessage = (event: MessageEvent) => {
 
 	if (msg.transfers) {
 		for (const t of msg.transfers.transfers || []) {
-			insertTransaction(t.transaction);
+			serverState.lastKnownTransactionId = Math.max(
+				serverState.lastKnownTransactionId,
+				t.transactionId
+			);
 			if (!serverState.transfers.find((p) => p.id === t.id)) {
 				serverState.transfers.push(t);
 			}
@@ -181,16 +370,25 @@ socket.onmessage = (event: MessageEvent) => {
 
 	const transferCreated = msg.transferCreated;
 	if (transferCreated) {
-		insertTransaction(transferCreated.transaction);
+		serverState.lastKnownTransactionId = Math.max(
+			serverState.lastKnownTransactionId,
+			transferCreated.transactionId
+		);
 		if (!serverState.transfers.find((p) => p.id === transferCreated.id)) {
 			serverState.transfers.push(transferCreated);
 		}
 	}
 
 	if (msg.accounts) {
-		serverState.accounts.clear();
+		// Upsert, don't clear. The backend sends this message as an initial bulk
+		// snapshot on connect AND as a single-entry rename broadcast; both cases
+		// should merge into existing state. Full state resets happen through
+		// `resetServerState()` on disconnect.
 		for (const account of msg.accounts.accounts || []) {
 			serverState.accounts.set(account.id, account);
+			if (account.name === 'Arbor Pixie') {
+				serverState.arborPixieAccountId = account.id;
+			}
 		}
 	}
 
@@ -199,14 +397,68 @@ socket.onmessage = (event: MessageEvent) => {
 		serverState.accounts.set(accountCreated.id, accountCreated);
 	}
 
+	if (msg.marketTypes) {
+		serverState.marketTypes.clear();
+		for (const mt of msg.marketTypes.marketTypes || []) {
+			serverState.marketTypes.set(mt.id, mt);
+		}
+	}
+
+	if (msg.marketType) {
+		serverState.marketTypes.set(msg.marketType.id, msg.marketType);
+	}
+
+	if (msg.marketTypeDeleted) {
+		serverState.marketTypes.delete(msg.marketTypeDeleted.marketTypeId);
+	}
+
+	if (msg.marketGroups) {
+		serverState.marketGroups.clear();
+		for (const mg of msg.marketGroups.marketGroups || []) {
+			serverState.marketGroups.set(mg.id, mg);
+		}
+	}
+
+	if (msg.marketGroup) {
+		serverState.marketGroups.set(msg.marketGroup.id, msg.marketGroup);
+	}
+
+	if (msg.universes) {
+		serverState.universes.clear();
+		for (const u of msg.universes.universes || []) {
+			serverState.universes.set(u.id, u);
+		}
+	}
+
+	if (msg.universe) {
+		serverState.universes.set(msg.universe.id, msg.universe);
+	}
+
 	const market = msg.market;
 	if (market) {
-		insertTransaction(market.transaction);
+		serverState.lastKnownTransactionId = Math.max(
+			serverState.lastKnownTransactionId,
+			market.transactionId
+		);
 		const marketData = serverState.markets.get(market.id) || new MarketData();
 		serverState.markets.set(market.id, marketData);
 		marketData.definition = websocket_api.Market.toObject(market as websocket_api.Market, {
 			defaults: true
 		});
+	}
+
+	const auction = msg.auction;
+	if (auction) {
+		serverState.lastKnownTransactionId = Math.max(
+			serverState.lastKnownTransactionId,
+			auction.transactionId
+		);
+		serverState.auctions.set(auction.id, auction);
+	}
+
+	const auctionDeleted = msg.auctionDeleted;
+	if (auctionDeleted) {
+		serverState.auctions.delete(auctionDeleted.auctionId);
 	}
 
 	const orders = msg.orders;
@@ -227,26 +479,71 @@ socket.onmessage = (event: MessageEvent) => {
 			websocket_api.Trade.toObject(trade as websocket_api.Trade, { defaults: true })
 		);
 		marketData.hasFullTradeHistory = trades.hasFullHistory ?? false;
+		if (trades.hasFullHistory && trades.redemptions?.length) {
+			marketData.redemptions = (trades.redemptions ?? []).map((r) =>
+				websocket_api.Redeemed.toObject(r as websocket_api.Redeemed, { defaults: true })
+			);
+		}
+	}
+
+	const marketStatusChanges = msg.marketStatusChanges;
+	if (marketStatusChanges) {
+		const marketData = serverState.markets.get(marketStatusChanges.marketId) || new MarketData();
+		serverState.markets.set(marketStatusChanges.marketId, marketData);
+		marketData.statusChanges = (marketStatusChanges.changes ?? []).map((c) =>
+			websocket_api.MarketStatusChange.toObject(c as websocket_api.MarketStatusChange, {
+				defaults: true
+			})
+		);
 	}
 
 	const marketSettled = msg.marketSettled;
 	if (marketSettled) {
-		insertTransaction(marketSettled.transaction);
+		serverState.lastKnownTransactionId = Math.max(
+			serverState.lastKnownTransactionId,
+			marketSettled.transactionId
+		);
 		const marketData = serverState.markets.get(marketSettled.id);
 		if (marketData) {
 			marketData.definition.closed = {
 				settlePrice: marketSettled.settlePrice,
-				transactionId: marketSettled.transaction?.id
+				transactionId: marketSettled.transactionId,
+				transactionTimestamp: marketSettled.transactionTimestamp
 			};
+			marketData.definition.open = undefined;
 			marketData.orders = [];
 		} else {
 			console.error(`Market ${marketSettled.id} not already in state`);
 		}
 	}
 
+	const auctionSettled = msg.auctionSettled;
+	if (auctionSettled) {
+		serverState.lastKnownTransactionId = Math.max(
+			serverState.lastKnownTransactionId,
+			auctionSettled.transactionId
+		);
+		const auctionData = serverState.auctions.get(auctionSettled.id);
+		if (auctionData) {
+			serverState.auctions.set(auctionSettled.id, {
+				...auctionData,
+				closed: { settlePrice: auctionSettled.settlePrice },
+				open: null,
+				buyerId: auctionSettled.buyerId,
+				buyers: auctionSettled.buyers ?? []
+			});
+			auctionData.open = null;
+		} else {
+			console.error(`Auction ${auctionSettled.id} not already in state`);
+		}
+	}
+
 	const ordersCancelled = msg.ordersCancelled;
 	if (ordersCancelled) {
-		insertTransaction(ordersCancelled.transaction);
+		serverState.lastKnownTransactionId = Math.max(
+			serverState.lastKnownTransactionId,
+			ordersCancelled.transactionId
+		);
 		const marketData = serverState.markets.get(ordersCancelled.marketId);
 		if (!marketData) {
 			console.error(`Market ${ordersCancelled.marketId} not already in state`);
@@ -259,7 +556,8 @@ socket.onmessage = (event: MessageEvent) => {
 					order.size = 0;
 					order.sizes = order.sizes || [];
 					order.sizes.push({
-						transactionId: ordersCancelled.transaction?.id,
+						transactionId: ordersCancelled.transactionId,
+						transactionTimestamp: ordersCancelled.transactionTimestamp,
 						size: 0
 					});
 				}
@@ -273,7 +571,10 @@ socket.onmessage = (event: MessageEvent) => {
 
 	const orderCreated = msg.orderCreated;
 	if (orderCreated) {
-		insertTransaction(orderCreated.transaction);
+		serverState.lastKnownTransactionId = Math.max(
+			serverState.lastKnownTransactionId,
+			orderCreated.transactionId
+		);
 		const marketData = serverState.markets.get(orderCreated.marketId);
 		if (!marketData) {
 			console.error(`Market ${orderCreated.marketId} not already in state`);
@@ -295,7 +596,8 @@ socket.onmessage = (event: MessageEvent) => {
 						order.size = fill.sizeRemaining;
 						order.sizes = order.sizes || [];
 						order.sizes.push({
-							transactionId: orderCreated.transaction?.id,
+							transactionId: orderCreated.transactionId,
+							transactionTimestamp: orderCreated.transactionTimestamp,
 							size: fill.sizeRemaining
 						});
 					}
@@ -327,7 +629,77 @@ socket.onmessage = (event: MessageEvent) => {
 	}
 
 	if (msg.requestFailed && msg.requestFailed.requestDetails?.kind === 'Authenticate') {
-		localStorage.removeItem('actAs');
+		const actAsKey = currentCohort ? `${currentCohort}:actAs` : 'actAs';
+		localStorage.removeItem(actAsKey);
+		console.log('Authentication failed');
 		authenticate();
 	}
+
+	const redeemed = msg.redeemed;
+	if (redeemed) {
+		serverState.lastKnownTransactionId = Math.max(
+			serverState.lastKnownTransactionId,
+			redeemed.transactionId
+		);
+		const marketData = serverState.markets.get(redeemed.fundId);
+		if (marketData) {
+			marketData.redemptions.push(redeemed);
+		}
+	}
+
+	if (msg.optionContracts) {
+		const contracts = msg.optionContracts;
+		if (contracts.marketId) {
+			serverState.optionContracts.set(contracts.marketId, contracts.contracts ?? []);
+		}
+	}
+
+	if (msg.optionExercised) {
+		serverState.lastKnownTransactionId = Math.max(
+			serverState.lastKnownTransactionId,
+			msg.optionExercised.transactionId
+		);
+	}
+
+	if (msg.sudoStatus) {
+		const wasEnabled = serverState.sudoEnabled;
+		serverState.sudoEnabled = msg.sudoStatus.enabled ?? false;
+		localStorage.setItem('sudoEnabled', String(serverState.sudoEnabled));
+		// Re-request full history for markets when sudo is enabled to get unhidden IDs
+		if (serverState.sudoEnabled && !wasEnabled) {
+			for (const [marketId, marketData] of serverState.markets) {
+				if (marketData.hasFullTradeHistory) {
+					sendClientMessage({ getFullTradeHistory: { marketId } });
+				}
+				if (marketData.hasFullOrderHistory) {
+					sendClientMessage({ getFullOrderHistory: { marketId } });
+				}
+			}
+		}
+	}
+};
+
+export const setSudo = (enabled: boolean) => {
+	sendClientMessage({ setSudo: { enabled } });
+};
+
+export const requestOptionContracts = (marketId: number) => {
+	sendClientMessage({ getOptionContracts: { marketId } });
+};
+
+// Sync sudo status across tabs via localStorage storage event
+if (browser) {
+	window.addEventListener('storage', (e) => {
+		if (e.key === 'sudoEnabled' && serverState.isAdmin) {
+			const enabled = e.newValue === 'true';
+			if (enabled !== serverState.sudoEnabled) {
+				sendClientMessage({ setSudo: { enabled } });
+			}
+		}
+	});
+}
+
+/** Force WebSocket to reconnect and re-authenticate (useful after login state changes) */
+export const reconnect = () => {
+	socket?.reconnect();
 };

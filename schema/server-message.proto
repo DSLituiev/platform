@@ -3,6 +3,8 @@ package websocket_api;
 
 import "portfolio.proto";
 import "market.proto";
+import "market-type.proto";
+import "market-group.proto";
 import "market-settled.proto";
 import "orders-cancelled.proto";
 import "order-created.proto";
@@ -13,9 +15,16 @@ import "account.proto";
 import "redeem.proto";
 import "orders.proto";
 import "trades.proto";
-import "transaction.proto";
+import "auction.proto";
+import "auction-settled.proto";
+import "universe.proto";
+import "exercise-option.proto";
+import "option-contract.proto";
+import "redeem-code.proto";
+import "market-status-changes.proto";
 
 message ServerMessage {
+  reserved 31;
   string request_id = 19;
   oneof message {
     Portfolio portfolio_updated = 1;
@@ -36,14 +45,39 @@ message ServerMessage {
     Redeemed redeemed = 18;
     Orders orders = 20;
     Trades trades = 21;
-    Transactions transactions = 22;
+    Auction auction = 22;
+    AuctionSettled auction_settled = 23;
+    AuctionDeleted auction_deleted = 24;
+    OwnershipRevoked ownership_revoked = 25;
+    MarketType market_type = 26;
+    MarketTypes market_types = 27;
+    MarketTypeDeleted market_type_deleted = 28;
+    MarketGroup market_group = 29;
+    MarketGroups market_groups = 30;
+    SudoStatus sudo_status = 32;
+    Universe universe = 33;
+    Universes universes = 34;
+    OwnerCreditRedistributed owner_credit_redistributed = 35;
+    OptionExercised option_exercised = 36;
+    OptionContracts option_contracts = 37;
+    RedeemCodeCreated redeem_code_created = 38;
+    RedeemCodeClaimed redeem_code_claimed = 39;
+    MarketStatusChanges market_status_changes = 40;
   }
+}
+message MarketTypeDeleted {
+  int64 market_type_id = 1;
 }
 message Authenticated {
   int64 account_id = 1;
+  bool is_cohort_member = 2;
+  bool auction_enabled = 3;
+  bool is_admin = 4;
 }
 message ActingAs {
   int64 account_id = 1;
+  int64 universe_id = 2;
+  int64 user_id = 3;
 }
 message Portfolios {
   repeated Portfolio portfolios = 1;
@@ -53,9 +87,23 @@ message OwnershipGiven {}
 message Transfers {
   repeated Transfer transfers = 1;
 }
-message Transactions {
-  repeated Transaction transactions = 1;
-}
 message Accounts {
   repeated Account accounts = 1;
 }
+message AuctionDeleted {
+  int64 auction_id = 1;
+}
+message OwnershipRevoked {}
+message MarketTypes {
+  repeated MarketType market_types = 1;
+}
+message MarketGroups {
+  repeated MarketGroup market_groups = 1;
+}
+message SudoStatus {
+  bool enabled = 1;
+}
+message Universes {
+  repeated Universe universes = 1;
+}
+message OwnerCreditRedistributed {}

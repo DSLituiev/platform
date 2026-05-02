@@ -1,46 +1,77 @@
-import {
-	PUBLIC_KINDE_CLIENT_ID,
-	PUBLIC_KINDE_DOMAIN,
-	PUBLIC_KINDE_REDIRECT_URI
-} from '$env/static/public';
-import createKindeClient from '@kinde-oss/kinde-auth-pkce-js';
+import { env } from '$env/dynamic/public';
+import { testKinde } from './testAuth.svelte';
 
-const kindePromise = createKindeClient({
-	audience: 'trading-server-api',
-	client_id: PUBLIC_KINDE_CLIENT_ID,
-	domain: PUBLIC_KINDE_DOMAIN,
-	redirect_uri: PUBLIC_KINDE_REDIRECT_URI || `${window.location.protocol}//${window.location.host}`
-});
+const isTestAuth = env.PUBLIC_TEST_AUTH === 'true';
 
-export const kinde = {
+// Only create the real Kinde client when not in test mode
+const kindePromise = isTestAuth
+	? null
+	: (async () => {
+			const envModule = await import('$env/static/public');
+			const PUBLIC_KINDE_CLIENT_ID = envModule.PUBLIC_KINDE_CLIENT_ID;
+			const PUBLIC_KINDE_DOMAIN = envModule.PUBLIC_KINDE_DOMAIN;
+			const PUBLIC_KINDE_REDIRECT_URI = envModule.PUBLIC_KINDE_REDIRECT_URI;
+			const { default: createKindeClient } = await import('@kinde-oss/kinde-auth-pkce-js');
+
+			console.log({
+				audience: 'trading-server-api',
+				client_id: PUBLIC_KINDE_CLIENT_ID,
+				domain: PUBLIC_KINDE_DOMAIN,
+				redirect_uri:
+					PUBLIC_KINDE_REDIRECT_URI || `${window.location.protocol}//${window.location.host}`
+			});
+
+			return createKindeClient({
+				audience: 'trading-server-api',
+				client_id: PUBLIC_KINDE_CLIENT_ID,
+				domain: PUBLIC_KINDE_DOMAIN,
+				redirect_uri:
+					PUBLIC_KINDE_REDIRECT_URI || `${window.location.protocol}//${window.location.host}`
+			});
+		})();
+
+const realKinde = {
 	async login() {
-		const kinde = await kindePromise;
-		kinde.login();
+		console.log('Logging in...');
+		const kindeClient = await kindePromise!;
+		kindeClient.login();
+		console.log('Login completed');
+	},
+	async register() {
+		console.log('Registering...');
+		const kindeClient = await kindePromise!;
+		kindeClient.register();
 	},
 	async logout() {
-		const kinde = await kindePromise;
-		kinde.logout();
+		localStorage.removeItem('actAs');
+		localStorage.removeItem('sudoEnabled');
+		console.log('Logging out...');
+		const kindeClient = await kindePromise!;
+		kindeClient.logout();
 	},
 	async isAuthenticated() {
-		const kinde = await kindePromise;
-		return kinde.isAuthenticated();
+		console.trace('Checking authentication...');
+		const kindeClient = await kindePromise!;
+		return kindeClient.isAuthenticated();
 	},
 	async getToken() {
-		const kinde = await kindePromise;
-		return kinde.getToken();
+		console.log('Getting token...');
+		const kindeClient = await kindePromise!;
+		console.log('got token...');
+		console.log(kindeClient);
+		console.log(await kindeClient.getToken());
+		return kindeClient.getToken();
 	},
 	async getIdToken() {
-		const kinde = await kindePromise;
-		return kinde.getIdToken();
+		console.log('Getting ID token...');
+		const kindeClient = await kindePromise!;
+		return kindeClient.getIdToken();
 	},
 	async getUser() {
-		const kinde = await kindePromise;
-		return kinde.getUser();
-	},
-	async isAdmin() {
-		const kinde = await kindePromise;
-		const roles = kinde.getClaim('roles');
-		// @ts-expect-error not bothering to validate roles
-		return !!roles?.value?.find(({ key }) => key === 'admin');
+		console.log('Getting user...');
+		const kindeClient = await kindePromise!;
+		return kindeClient.getUser();
 	}
 };
+
+export const kinde = isTestAuth ? testKinde : realKinde;

@@ -2,26 +2,71 @@
 
 [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/tradingbootcamp/platform?quickstart=1)
 
-TODO: add stuff about the actual bootcamp, maybe some design details, etc.
+[Quantitative Trading Bootcamp](https://www.trading.camp/) teaches the fundamentals of quantitative trading: markets, order books, auctions, risk and sizing, adverse selection, arbitrage, and how quant trading firms make money. Our philosophy is that the best way to learn to trade is by trading. This repository contains the exchange we use to run a simulated economy and allow students to make and trade on markets.
 
-## Working locally
+## Prerequisites
 
-### Requirements
+- **pnpm**: Node package manager (`npm install -g pnpm`)
+- **Rust**: Install via [rustup](https://rustup.rs/) (for backend development)
+- **protoc**: Protocol buffer compiler (for backend development)
+  - Debian/Ubuntu: `apt-get install protobuf-compiler`
+  - macOS: `brew install protobuf`
 
-- Rust >= 1.8 nightly
-- node 20
-- pnpm
-- protobuf-compiler
+## Making Frontend changes
 
-### Setting up
+You need to have pnpm installed.
 
-- Place one .env file in backend/ and another in frontend/ and populate them. See [backend/example.env](backend/example.env) and [frontend/example.env](frontend/example.env) for which keys are needed.
-- Install `sqlx-cli` if you haven't already: `cargo install sqlx-cli`
-- Run `cd backend && sqlx db create && sqlx migrate run`
-- From the root directory, run `pnpm i`
-- Optional - install recommended vscode extensions
+To run the frontend:
+```
+pnpm i
+```
 
-### Running
+Then run:
+```
+pnpm dev
+```
+This will start the frontend on `localhost:5173`.
 
-- Run `cd backend && cargo run` to start the backend
-- Run `pnpm dev` from the root directory to start the frontend
+Since this will run against the production backend, you should probably create a test account in Accounts.
+
+Copy the appropriate environment template to `frontend/.env` for your use case:
+
+For frontend development against production backend:
+```
+cp frontend/remote.env frontend/.env
+```
+
+## Making Backend Changes
+
+Copy the local environment template:
+```
+cp frontend/local.env frontend/.env
+```
+
+First, set up the database:
+```
+cd backend
+sqlx db create
+sqlx migrate run
+```
+
+Then run the exchange server:
+```
+cargo run
+```
+
+Run tests and linter before submitting changes:
+```
+cargo test-all
+cargo clippy
+```
+
+## Documentation
+
+- [Accounts](docs/accounts.md) - User accounts, alt accounts, ownership/sharing, portfolios, transfers
+- [Architecture](docs/architecture.md) - System overview and component design
+- [Auctions](docs/auctions.md) - Auction system, buy-it-now, settlement
+- [Order Matching](docs/order-matching.md) - Orders, order book, trade execution, price-time priority
+- [Sudo](docs/sudo.md) - Admin permissions, sudo mode, rate limits
+- [Visibility](docs/visibility.md) - Market visibility restrictions, account ID hiding
+- [WebSocket Protocol](docs/websocket-protocol.md) - Client-server communication, message types, request/response patterns

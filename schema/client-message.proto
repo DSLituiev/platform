@@ -3,12 +3,27 @@ package websocket_api;
 
 import "make-transfer.proto";
 import "create-market.proto";
+import "create-universe.proto";
+import "create-market-type.proto";
+import "delete-market-type.proto";
+import "create-market-group.proto";
+import "create-auction.proto";
 import "settle-market.proto";
+import "edit-market.proto";
+import "settle-auction.proto";
+import "edit-auction.proto";
 import "create-order.proto";
 import "out.proto";
 import "redeem.proto";
+import "buy-auction.proto";
+import "gift.proto";
+import "redistribute-owner-credit.proto";
+import "exercise-option.proto";
+import "option-contract.proto";
+import "redeem-code.proto";
 
 message ClientMessage {
+  reserved 24;
   string request_id = 14;
   oneof message {
     CreateMarket create_market = 1;
@@ -24,6 +39,24 @@ message ClientMessage {
     GetFullOrderHistory get_full_order_history = 11;
     GetFullTradeHistory get_full_trade_history = 12;
     Redeem redeem = 13;
+    CreateAuction create_auction = 15;
+    SettleAuction settle_auction = 16;
+    DeleteAuction delete_auction = 17;
+    EditMarket edit_market = 18;
+    EditAuction edit_auction = 25;
+    RevokeOwnership revoke_ownership = 19;
+    BuyAuction buy_auction = 20;
+    CreateMarketType create_market_type = 21;
+    DeleteMarketType delete_market_type = 22;
+    CreateMarketGroup create_market_group = 23;
+    SetSudo set_sudo = 26;
+    CreateUniverse create_universe = 27;
+    Gift gift = 28;
+    RedistributeOwnerCredit redistribute_owner_credit = 29;
+    ExerciseOption exercise_option = 30;
+    GetOptionContracts get_option_contracts = 31;
+    CreateRedeemCode create_redeem_code = 32;
+    ClaimRedeemCode claim_redeem_code = 33;
   }
 }
 message GetFullOrderHistory {
@@ -46,8 +79,21 @@ message ActAs {
 message CreateAccount {
   int64 owner_id = 1;
   string name = 2;
+  int64 universe_id = 3;      // Which universe (default 0)
+  double initial_balance = 4;  // Optional starting clips
+  optional string color = 5;   // Optional account color in #RRGGBB format
 }
 message ShareOwnership {
   int64 of_account_id = 1;
   int64 to_account_id = 2;
+}
+message RevokeOwnership {
+  int64 of_account_id = 1;
+  int64 from_account_id = 2;
+}
+message DeleteAuction {
+  int64 auction_id = 1;
+}
+message SetSudo {
+  bool enabled = 1;
 }

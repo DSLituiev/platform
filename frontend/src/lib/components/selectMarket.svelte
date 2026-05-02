@@ -1,0 +1,119 @@
+<script lang="ts">
+	import { goto } from '$app/navigation';
+	import { page } from '$app/stores';
+	import { getCurrentCohort, serverState } from '$lib/api.svelte';
+	import { shouldShowPuzzleHuntBorder } from '$lib/components/marketDataUtils';
+	import { buttonVariants } from '$lib/components/ui/button';
+	import * as Command from '$lib/components/ui/command';
+	import * as Popover from '$lib/components/ui/popover';
+	import { useStarredMarkets, usePinnedMarkets } from '$lib/starPinnedMarkets.svelte';
+	import MarketName from '$lib/components/marketName.svelte';
+	import { cn } from '$lib/utils';
+	import ChevronsUpDown from '@lucide/svelte/icons/chevrons-up-down';
+	import { tick } from 'svelte';
+
+	let { groupId }: { groupId?: number | bigint } = $props();
+	let cohortPrefix = $derived(getCurrentCohort() ? `/${getCurrentCohort()}` : '');
+
+	let popoverOpen = $state(false);
+	let popoverTriggerRef = $state<HTMLButtonElement>(null!);
+	const { isStarred } = useStarredMarkets();
+	const { isPinned } = usePinnedMarkets();
+
+	// We want to refocus the trigger button when the user selects
+	// an item from the list so users can continue navigating the
+	// rest of the form with the keyboard.
+	function onSelect(id?: number) {
+		popoverOpen = false;
+		tick().then(() => {
+			popoverTriggerRef.focus();
+		});
+		if (id) {
+			goto(`${cohortPrefix}/market/${id}`);
+		} else {
+			goto(`${cohortPrefix}/market`);
+		}
+	}
+
+	let availableMarkets = $derived.by(() => {
+		return [...serverState.markets.entries()]
+			.filter(([, market]) => {
+				// If groupId is provided, only show markets in the same group
+				if (groupId != null && Number(groupId) > 0) {
+					return Number(market.definition.groupId) === Number(groupId);
+				}
+				return true;
+			})
+			.map(([id, market]) => ({
+				id,
+				market,
+				name: market.definition.name || `Market ${id}`,
+				isOpen: market.definition.open ? true : false,
+				transactionId: Number(market.definition.transactionId || 0),
+				starred: isStarred(Number(id)),
+				pinned: isPinned(Number(id))
+			}))
+			.sort((a, b) => {
+				if (a.pinned !== b.pinned) {
+					return a.pinned ? -1 : 1;
+				}
+				if (a.starred !== b.starred) {
+					return a.starred ? -1 : 1;
+				}
+				if (a.isOpen !== b.isOpen) {
+					return a.isOpen ? -1 : 1;
+				}
+				return b.transactionId - a.transactionId;
+			});
+	});
+
+	let id = $derived(Number($page.params.id));
+	let marketData = $derived(Number.isNaN(id) ? undefined : serverState.markets.get(id));
+</script>
+
+<div class="relative">
+	<Popover.Root bind:open={popoverOpen}>
+		<Popover.Trigger
+			class={cn(
+				buttonVariants({ variant: 'ghost' }),
+				'justify-between px-2 text-2xl font-semibold'
+			)}
+			role="combobox"
+			bind:ref={popoverTriggerRef}
+		>
+			<h1 class="text-start">
+				<MarketName name={marketData?.definition.name} fallback="Select Market" variant="compact" />
+			</h1>
+			<ChevronsUpDown class="ml-2 h-4 w-4 shrink-0 opacity-50" />
+		</Popover.Trigger>
+		<Popover.Content class="w-48 p-0">
+			<Command.Root>
+				<Command.Input autofocus placeholder="Search markets..." class="h-9" />
+				<Command.List>
+					<Command.Empty>No markets available</Command.Empty>
+					<Command.Group>
+						<Command.Item class="p-0" value="all markets" onSelect={() => onSelect()}>
+							<a href="{cohortPrefix}/market" class="w-full p-2 font-semibold italic">
+								All Markets
+							</a>
+						</Command.Item>
+						{#each availableMarkets as { id, name, market } (id)}
+							<Command.Item
+								class={cn(
+									'p-0',
+									shouldShowPuzzleHuntBorder(market.definition) && 'puzzle-hunt-frame'
+								)}
+								value={name}
+								onSelect={() => onSelect(id)}
+							>
+								<a href={`${cohortPrefix}/market/${id}`} class="w-full p-2">
+									<MarketName {name} variant="compact" />
+								</a>
+							</Command.Item>
+						{/each}
+					</Command.Group>
+				</Command.List>
+			</Command.Root>
+		</Popover.Content>
+	</Popover.Root>
+</div>

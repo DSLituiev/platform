@@ -1,6 +1,80 @@
 import type { websocket_api } from 'schema-js';
 import { toast } from 'svelte-sonner';
 import { accountName, serverState } from './api.svelte';
+import { formatMarketName } from '$lib/utils';
+
+// Add batch notification tracking
+interface BatchedNotifications {
+	ordersCreated: number;
+	ordersFilled: number;
+	ordersCancelled: number;
+	redeemed: number;
+}
+
+// Track batches by market ID
+const batchesByMarket = new Map<
+	number,
+	{
+		timeout: NodeJS.Timeout;
+		batch: BatchedNotifications;
+		marketName: string;
+		lastSent: number; // Add timestamp of last notification
+	}
+>();
+
+function sendBatchedNotification(marketId: number) {
+	const batchData = batchesByMarket.get(marketId);
+	if (!batchData) return;
+
+	const { batch, marketName } = batchData;
+	const messages: string[] = [];
+	if (batch.ordersCreated) messages.push(`${batch.ordersCreated} orders created`);
+	if (batch.ordersFilled) messages.push(`${batch.ordersFilled} orders filled`);
+	if (batch.ordersCancelled) messages.push(`${batch.ordersCancelled} orders cancelled`);
+	if (batch.redeemed) messages.push(`${batch.redeemed} redemptions`);
+
+	if (messages.length > 0) {
+		toast.success(`${marketName}: ${messages.join(', ')}`);
+		batchData.lastSent = Date.now();
+		// Reset the batch counts after sending
+		batchData.batch = {
+			ordersCreated: 0,
+			ordersFilled: 0,
+			ordersCancelled: 0,
+			redeemed: 0
+		};
+	} else {
+		batchesByMarket.delete(marketId);
+	}
+}
+
+function queueBatchedNotification(marketId: number, marketName: string) {
+	const existing = batchesByMarket.get(marketId);
+	const now = Date.now();
+
+	if (existing) {
+		// If it's been more than 500ms since last notification, send immediately
+		if (now - existing.lastSent >= 500) {
+			sendBatchedNotification(marketId);
+		}
+		clearTimeout(existing.timeout);
+		const timeout = setTimeout(() => sendBatchedNotification(marketId), 500);
+		existing.timeout = timeout;
+	} else {
+		const timeout = setTimeout(() => sendBatchedNotification(marketId), 500);
+		batchesByMarket.set(marketId, {
+			timeout,
+			marketName,
+			lastSent: 0, // Never sent before
+			batch: {
+				ordersCreated: 0,
+				ordersFilled: 0,
+				ordersCancelled: 0,
+				redeemed: 0
+			}
+		});
+	}
+}
 
 export const notifyUser = (msg: websocket_api.ServerMessage | null): void => {
 	if (!msg) return;
@@ -9,15 +83,18 @@ export const notifyUser = (msg: websocket_api.ServerMessage | null): void => {
 	switch (msg.message) {
 		case 'actingAs': {
 			const actingAs = msg.actingAs!;
-			const name = serverState.accounts.get(actingAs.accountId || 0)?.name;
-			toast.info(`Acting as ${name}`);
+			toast.info(`Acting as ${accountName(actingAs.accountId)}`);
 			return;
 		}
 		case 'market': {
 			const market = msg.market!;
 			// market messages that arrive before the first actingAs are just initial data
-			if (serverState.actingAs && market.ownerId === serverState.userId) {
-				toast.success('Market created', { description: market.name || '' });
+			if (
+				serverState.actingAs &&
+				market.ownerId === serverState.userId &&
+				!serverState.markets.has(market.id ?? 0)
+			) {
+				toast.success('Market created', { description: formatMarketName(market.name) });
 			}
 			return;
 		}
@@ -28,7 +105,7 @@ export const notifyUser = (msg: websocket_api.ServerMessage | null): void => {
 				console.error('Market not in state', { marketSettled });
 				return;
 			}
-			const description = `${market.definition?.name} settled at ${marketSettled.settlePrice}`;
+			const description = `${formatMarketName(market.definition?.name)} settled at ${marketSettled.settlePrice}`;
 			if (market.definition?.ownerId === serverState.userId) {
 				toast.success('Market settled', { description });
 			} else {
@@ -40,19 +117,40 @@ export const notifyUser = (msg: websocket_api.ServerMessage | null): void => {
 			const ordersCancelled = msg.ordersCancelled!;
 			const market = serverState.markets.get(ordersCancelled.marketId);
 			const firstOrder = market?.orders?.find((o) => o.id === (ordersCancelled.orderIds || [])[0]);
-			if (firstOrder?.ownerId === serverState.actingAs) {
-				toast.success(
-					`${ordersCancelled.orderIds?.length === 1 ? 'Order' : `${ordersCancelled.orderIds?.length} orders`} cancelled`
-				);
+			if (firstOrder?.ownerId === serverState.actingAs && market) {
+				const batchData =
+					batchesByMarket.get(market.definition.id) ||
+					batchesByMarket
+						.set(market.definition.id, {
+							timeout: setTimeout(() => {}, 0),
+							batch: { ordersCreated: 0, ordersFilled: 0, ordersCancelled: 0, redeemed: 0 },
+							marketName: formatMarketName(market.definition?.name),
+							lastSent: 0
+						})
+						.get(market.definition.id)!;
+
+				batchData.batch.ordersCancelled += ordersCancelled.orderIds?.length || 0;
+				queueBatchedNotification(market.definition.id, batchData.marketName);
 			}
 			return;
 		}
 		case 'redeemed': {
 			const redeemed = msg.redeemed!;
 			const market = serverState.markets.get(redeemed.fundId);
+			if (redeemed.accountId === serverState.actingAs && market) {
+				const batchData =
+					batchesByMarket.get(market.definition.id) ||
+					batchesByMarket
+						.set(market.definition.id, {
+							timeout: setTimeout(() => {}, 0),
+							batch: { ordersCreated: 0, ordersFilled: 0, ordersCancelled: 0, redeemed: 0 },
+							marketName: formatMarketName(market.definition?.name),
+							lastSent: 0
+						})
+						.get(market.definition.id)!;
 
-			if (redeemed.accountId === serverState.actingAs) {
-				toast.success(`Redeemed ${redeemed.amount} contracts of ${market?.definition?.name}`);
+				batchData.batch.redeemed += 1;
+				queueBatchedNotification(market.definition.id, batchData.marketName);
 			}
 			return;
 		}
@@ -61,26 +159,30 @@ export const notifyUser = (msg: websocket_api.ServerMessage | null): void => {
 			if (orderCreated.accountId !== serverState.actingAs) {
 				return;
 			}
+
+			const market = serverState.markets.get(orderCreated.order?.marketId || 0);
+			if (!market) return;
+
+			const batchData =
+				batchesByMarket.get(market.definition.id) ||
+				batchesByMarket
+					.set(market.definition.id, {
+						timeout: setTimeout(() => {}, 0),
+						batch: { ordersCreated: 0, ordersFilled: 0, ordersCancelled: 0, redeemed: 0 },
+						marketName: formatMarketName(market.definition?.name),
+						lastSent: 0
+					})
+					.get(market.definition.id)!;
+
 			const realFills =
 				orderCreated.fills?.filter((fill) => fill.ownerId !== serverState.actingAs) ?? [];
-			const fillSize = realFills.reduce((acc, fill) => acc + (fill.sizeFilled ?? 0), 0);
-			const fillPrice = realFills.reduce(
-				(acc, fill) => acc + ((fill.price ?? 0) * (fill.sizeFilled ?? 0)) / fillSize!,
-				0
-			);
-			const fillSizeString = String(fillSize || '').includes('.') ? fillSize.toFixed(2) : fillSize;
-			const fillPriceString = String(fillPrice || '').includes('.')
-				? fillPrice.toFixed(2)
-				: fillPrice;
-			const message = orderCreated.order
-				? realFills.length
-					? `Order partially filled`
-					: 'Order created'
-				: realFills.length
-					? `Order filled`
-					: 'Order self-filled';
-			const description = fillSize ? `filled ${fillSizeString} @ ${fillPriceString}` : undefined;
-			toast.success(message, { description });
+
+			if (realFills.length > 0) {
+				batchData.batch.ordersFilled += 1;
+			} else if (orderCreated.order) {
+				batchData.batch.ordersCreated += 1;
+			}
+			queueBatchedNotification(market.definition.id, batchData.marketName);
 			return;
 		}
 		case 'transferCreated': {
@@ -92,7 +194,7 @@ export const notifyUser = (msg: websocket_api.ServerMessage | null): void => {
 
 			if (initiator?.id === serverState.userId) {
 				toast.success('Transfer created', {
-					description: `You transfered ${amount} from ${accountName(fromAccount?.id, 'Yourself')} to ${accountName(toAccount?.id, 'Yourself')}`
+					description: `You transfered ${amount} from ${accountName(fromAccount?.id)} to ${accountName(toAccount?.id)}`
 				});
 			} else {
 				toast.info('Transfer created', {
@@ -119,6 +221,16 @@ export const notifyUser = (msg: websocket_api.ServerMessage | null): void => {
 		case 'ownershipGiven':
 			toast.success('Ownership shared');
 			return;
+		case 'ownershipRevoked':
+			toast.success('Ownership revoked');
+			return;
+		case 'redeemCodeClaimed': {
+			const claimed = msg.redeemCodeClaimed!;
+			toast.success('Code redeemed', {
+				description: `You received 📎 ${claimed.amount}`
+			});
+			return;
+		}
 		case 'requestFailed': {
 			const requestFailed = msg.requestFailed!;
 			toast.error(`${requestFailed.requestDetails?.kind} failed`, {

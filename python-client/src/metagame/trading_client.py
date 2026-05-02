@@ -1,7 +1,12 @@
+from __future__ import annotations
+
+import bisect
+import json
 import logging
+import re
+import urllib.request
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
 from typing import Dict, List, Optional
 
 import betterproto
@@ -13,6 +18,25 @@ from . import websocket_api
 logger = logging.getLogger(__name__)
 
 
+def list_cohorts(api_url: str, jwt: str) -> dict:
+    """Fetch cohorts and config from the server.
+
+    Args:
+        api_url: Base HTTP(S) URL of the server (e.g. "https://trading-bootcamp.fly.dev")
+        jwt: JWT token for authentication
+
+    Returns:
+        dict with 'cohorts', 'default_cohort', 'active_auction_cohort', 'public_auction_enabled'
+    """
+    base = re.sub(r"/+$", "", api_url)
+    # Normalize ws/wss URLs to http/https
+    base = re.sub(r"^ws(s?)://", r"http\1://", base)
+    url = f"{base}/api/cohorts"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {jwt}"})
+    with urllib.request.urlopen(req) as resp:
+        return json.loads(resp.read())
+
+
 class TradingClient:
     """
     Client for interacting with the exchange server.
@@ -21,11 +45,34 @@ class TradingClient:
     _ws: ClientConnection
     _state: "State"
 
-    def __init__(self, api_url: str, jwt: str, act_as: int):
+    def __init__(self, api_url: str, jwt: str, act_as: int, cohort: Optional[str] = None, close_timeout: float = 1.0):
         """
         Connect, Authenticate, then make sure all of the messages holding initial state have been received.
+
+        Args:
+            api_url: Base URL of the exchange server (e.g. "https://trading-bootcamp.fly.dev")
+            jwt: JWT token for authentication
+            act_as: Account ID to act as (0 for own account)
+            cohort: Cohort name to connect to. If None, uses the server's default cohort.
+            close_timeout: Timeout in seconds for WebSocket close handshake (default: 1.0)
         """
-        self._ws = connect(api_url, max_size=2**27)
+        if cohort is None:
+            info = list_cohorts(api_url, jwt)
+            cohort = info.get("default_cohort")
+            if not cohort:
+                raise ValueError(
+                    "No cohort specified and no default cohort configured on the server. "
+                    "Pass cohort='<name>' or ask an admin to set a default cohort."
+                )
+            logger.info(f"Using default cohort: {cohort}")
+
+        # Build WebSocket URL: convert http(s) to ws(s) and append path
+        base = re.sub(r"/+$", "", api_url)
+        base = re.sub(r"^http(s?)://", r"ws\1://", base)
+        base = re.sub(r"^ws(s?)://", r"ws\1://", base)
+        ws_url = f"{base}/api/ws/{cohort}"
+
+        self._ws = connect(ws_url, max_size=2**27, close_timeout=close_timeout)
         self._state = State()
         self._outstanding_requests = set()
         authenticate = websocket_api.Authenticate(jwt=jwt, act_as=act_as)
@@ -92,15 +139,21 @@ class TradingClient:
         assert isinstance(message, websocket_api.OrdersCancelled)
         return message
 
-    def out(self, market_id: int) -> websocket_api.Out:
+    def out(
+        self, market_id: Optional[int] = None, side: Optional[websocket_api.Side] = None
+    ) -> websocket_api.Out:
         """
-        Cancel all orders for a market.
+        Cancel orders.
+        If market_id is provided, cancel orders only for that market.
+        If side is provided, cancel orders only for that side (BID or OFFER).
+        If neither is provided, cancel orders across ALL markets.
         """
-        msg = websocket_api.ClientMessage(
-            out=websocket_api.Out(
-                market_id=market_id,
-            ),
-        )
+        out_msg = websocket_api.Out()
+        if market_id is not None:
+            out_msg.market_id = market_id
+        if side is not None:
+            out_msg.side = side
+        msg = websocket_api.ClientMessage(out=out_msg)
         response = self.request(msg)
         _, message = betterproto.which_one_of(response, "message")
         assert isinstance(message, websocket_api.Out)
@@ -125,28 +178,120 @@ class TradingClient:
         assert isinstance(message, websocket_api.Redeemed)
         return message
 
+    def exercise_option(
+        self, contract_id: int, amount: float, option_market_id: int = 0
+    ) -> websocket_api.OptionExercised:
+        """
+        Exercise an option contract.
+        Note that if amount is passed as float it will be quantized to 2 decimal places.
+        """
+        amount_quantized = round(amount, 2)
+        if abs(amount_quantized - amount) > 1e-4:
+            logger.warning(f"Amount {amount} quantized to {amount_quantized}")
+        msg = websocket_api.ClientMessage(
+            exercise_option=websocket_api.ExerciseOption(
+                option_market_id=option_market_id,
+                contract_id=contract_id,
+                amount=amount_quantized,
+            ),
+        )
+        response = self.request(msg)
+        _, message = betterproto.which_one_of(response, "message")
+        assert isinstance(message, websocket_api.OptionExercised)
+        return message
+
+    def get_option_contracts(
+        self, market_id: int
+    ) -> websocket_api.OptionContracts:
+        """
+        Get option contracts for a market where the current account is buyer or writer.
+        """
+        msg = websocket_api.ClientMessage(
+            get_option_contracts=websocket_api.GetOptionContracts(
+                market_id=market_id,
+            ),
+        )
+        response = self.request(msg)
+        _, message = betterproto.which_one_of(response, "message")
+        assert isinstance(message, websocket_api.OptionContracts)
+        return message
+
+    def create_option_market(
+        self,
+        name: str,
+        description: str,
+        underlying_market_id: int,
+        strike_price: float,
+        is_call: bool,
+        expiration_date: Optional[float] = None,
+        hide_account_ids: bool = False,
+        visible_to: List[int] = [],
+        type_id: Optional[int] = None,
+        group_id: Optional[int] = None,
+    ) -> websocket_api.Market:
+        """
+        Create an option market. Requires admin privileges.
+        The min/max settlement bounds are auto-calculated from the underlying market and strike price.
+        expiration_date is a Unix timestamp in seconds, or None for no expiration.
+        """
+        option_info = websocket_api.OptionInfo(
+            underlying_market_id=underlying_market_id,
+            strike_price=strike_price,
+            is_call=is_call,
+        )
+        if expiration_date is not None:
+            from datetime import datetime, timezone
+            option_info.expiration_date = datetime.fromtimestamp(expiration_date, tz=timezone.utc)
+        create_market = websocket_api.CreateMarket(
+            name=name,
+            description=description,
+            min_settlement=0.0,
+            max_settlement=0.0,
+            hide_account_ids=hide_account_ids,
+            visible_to=visible_to,
+            option=option_info,
+        )
+        if type_id is not None:
+            create_market.type_id = type_id
+        if group_id is not None:
+            create_market.group_id = group_id
+        msg = websocket_api.ClientMessage(create_market=create_market)
+        response = self.request(msg)
+        _, message = betterproto.which_one_of(response, "message")
+        assert isinstance(message, websocket_api.Market)
+        return message
+
     def create_market(
         self,
         name: str,
         description: str,
         min_settlement: float,
         max_settlement: float,
-        redeemable_for: List[websocket_api.Redeemable],
+        redeemable_for: List[websocket_api.Redeemable] = [],
         redeem_fee: float = 0.0,
+        hide_account_ids: bool = False,
+        visible_to: List[int] = [],
+        type_id: Optional[int] = None,
+        group_id: Optional[int] = None,
     ) -> websocket_api.Market:
         """
         Create a new market on the exchange.
         """
-        msg = websocket_api.ClientMessage(
-            create_market=websocket_api.CreateMarket(
-                name=name,
-                description=description,
-                min_settlement=min_settlement,
-                max_settlement=max_settlement,
-                redeemable_for=redeemable_for,
-                redeem_fee=redeem_fee,
-            ),
+        create_market = websocket_api.CreateMarket(
+            name=name,
+            description=description,
+            min_settlement=min_settlement,
+            max_settlement=max_settlement,
+            redeemable_for=redeemable_for,
+            redeem_fee=redeem_fee,
+            hide_account_ids=hide_account_ids,
+            visible_to=visible_to,
         )
+        if type_id is not None:
+            create_market.type_id = type_id
+        if group_id is not None:
+            create_market.group_id = group_id
+        msg = websocket_api.ClientMessage(create_market=create_market)
         response = self.request(msg)
         _, message = betterproto.which_one_of(response, "message")
         assert isinstance(message, websocket_api.Market)
@@ -188,19 +333,103 @@ class TradingClient:
         assert isinstance(message, websocket_api.Transfer)
         return message
 
-    def create_account(self, owner_id: int, name: str) -> websocket_api.Account:
+    def gift(
+        self, to_account_id: int, amount: float, note: str = ""
+    ) -> websocket_api.Transfer:
+        """
+        Gift clips to an account (mint from nothing). Requires universe-owner
+        or admin privileges. Unlike make_transfer, gifting works even when the
+        target is a shared-ownership account with open positions, because it
+        does not modify ownership credits.
+        """
+        msg = websocket_api.ClientMessage(
+            gift=websocket_api.Gift(
+                to_account_id=to_account_id,
+                amount=amount,
+                note=note,
+            ),
+        )
+        response = self.request(msg)
+        _, message = betterproto.which_one_of(response, "message")
+        assert isinstance(message, websocket_api.Transfer)
+        return message
+
+    def redistribute_owner_credit(
+        self, account_id: int, from_owner_id: int
+    ) -> websocket_api.OwnerCreditRedistributed:
+        """
+        Redistribute one owner's credit on a shared account proportionally
+        to the other owners, setting the source owner's credit to 0.
+        Requires admin privileges.
+        """
+        msg = websocket_api.ClientMessage(
+            redistribute_owner_credit=websocket_api.RedistributeOwnerCredit(
+                account_id=account_id,
+                from_owner_id=from_owner_id,
+            ),
+        )
+        response = self.request(msg)
+        _, message = betterproto.which_one_of(response, "message")
+        assert isinstance(message, websocket_api.OwnerCreditRedistributed)
+        return message
+
+    def create_account(
+        self,
+        owner_id: int,
+        name: str,
+        universe_id: int = 0,
+        initial_balance: float = 0.0,
+        color: Optional[str] = None,
+    ) -> websocket_api.Account:
         """
         Create a new account.
+
+        Args:
+            owner_id: The account ID of the owner.
+            name: The name of the new account.
+            universe_id: The universe to create the account in (default: 0, main universe).
+            initial_balance: Initial balance for the account (only universe owners can set non-zero).
+            color: Optional account color in #RRGGBB format.
         """
+        normalized_color = ""
+        if color is not None:
+            normalized_color = color.strip().lower()
+            if normalized_color and not normalized_color.startswith("#"):
+                normalized_color = f"#{normalized_color}"
         msg = websocket_api.ClientMessage(
             create_account=websocket_api.CreateAccount(
                 owner_id=owner_id,
                 name=name,
+                universe_id=universe_id,
+                initial_balance=initial_balance,
+                color=normalized_color,
             ),
         )
         response = self.request(msg)
         _, message = betterproto.which_one_of(response, "message")
         assert isinstance(message, websocket_api.Account)
+        return message
+
+    def create_universe(self, name: str, description: str = "") -> websocket_api.Universe:
+        """
+        Create a new universe.
+
+        Args:
+            name: The name of the universe (must be unique).
+            description: Optional description of the universe.
+
+        Returns:
+            The created Universe object.
+        """
+        msg = websocket_api.ClientMessage(
+            create_universe=websocket_api.CreateUniverse(
+                name=name,
+                description=description,
+            ),
+        )
+        response = self.request(msg)
+        _, message = betterproto.which_one_of(response, "message")
+        assert isinstance(message, websocket_api.Universe)
         return message
 
     def share_ownership(
@@ -218,6 +447,23 @@ class TradingClient:
         response = self.request(msg)
         _, message = betterproto.which_one_of(response, "message")
         assert isinstance(message, websocket_api.OwnershipGiven)
+        return message
+
+    def revoke_ownership(
+        self, of_account_id: int, from_account_id: int
+    ) -> websocket_api.OwnershipRevoked:
+        """
+        Revoke ownership of an account.
+        """
+        msg = websocket_api.ClientMessage(
+            revoke_ownership=websocket_api.RevokeOwnership(
+                of_account_id=of_account_id,
+                from_account_id=from_account_id,
+            ),
+        )
+        response = self.request(msg)
+        _, message = betterproto.which_one_of(response, "message")
+        assert isinstance(message, websocket_api.OwnershipRevoked)
         return message
 
     def get_full_order_history(self, market_id: int) -> websocket_api.Orders:
@@ -247,6 +493,323 @@ class TradingClient:
         _, message = betterproto.which_one_of(response, "message")
         assert isinstance(message, websocket_api.Trades)
         return message
+
+    def act_as(self, account_id: int) -> websocket_api.ActingAs:
+        """
+        Act as an owned account.
+        """
+        msg = websocket_api.ClientMessage(
+            act_as=websocket_api.ActAs(account_id=account_id),
+        )
+        response = self.request(msg)
+        _, message = betterproto.which_one_of(response, "message")
+        assert isinstance(message, websocket_api.ActingAs)
+        return message
+
+    def set_sudo(self, enabled: bool) -> websocket_api.SudoStatus:
+        """
+        Enable or disable sudo mode (admin only).
+        When sudo mode is enabled, admin users can perform privileged operations.
+        """
+        msg = websocket_api.ClientMessage(
+            set_sudo=websocket_api.SetSudo(enabled=enabled),
+        )
+        response = self.request(msg)
+        _, message = betterproto.which_one_of(response, "message")
+        assert isinstance(message, websocket_api.SudoStatus)
+        return message
+
+    def create_market_type(
+        self, name: str, description: str, public: bool = False
+    ) -> websocket_api.MarketType:
+        """
+        Create a new market type (admin only).
+        """
+        msg = websocket_api.ClientMessage(
+            create_market_type=websocket_api.CreateMarketType(
+                name=name,
+                description=description,
+                public=public,
+            ),
+        )
+        response = self.request(msg)
+        _, message = betterproto.which_one_of(response, "message")
+        assert isinstance(message, websocket_api.MarketType)
+        return message
+
+    def delete_market_type(self, market_type_id: int) -> websocket_api.MarketTypeDeleted:
+        """
+        Delete a market type (admin only).
+        """
+        msg = websocket_api.ClientMessage(
+            delete_market_type=websocket_api.DeleteMarketType(
+                market_type_id=market_type_id,
+            ),
+        )
+        response = self.request(msg)
+        _, message = betterproto.which_one_of(response, "message")
+        assert isinstance(message, websocket_api.MarketTypeDeleted)
+        return message
+
+    def create_market_group(
+        self, name: str, description: str, type_id: int
+    ) -> websocket_api.MarketGroup:
+        """
+        Create a new market group (admin only).
+        """
+        msg = websocket_api.ClientMessage(
+            create_market_group=websocket_api.CreateMarketGroup(
+                name=name,
+                description=description,
+                type_id=type_id,
+            ),
+        )
+        response = self.request(msg)
+        _, message = betterproto.which_one_of(response, "message")
+        assert isinstance(message, websocket_api.MarketGroup)
+        return message
+
+    def create_auction(
+        self,
+        name: str,
+        description: str,
+        image_filename: Optional[str] = None,
+        bin_price: Optional[float] = None,
+    ) -> websocket_api.Auction:
+        """
+        Create a new auction.
+        """
+        create_auction = websocket_api.CreateAuction(
+            name=name,
+            description=description,
+        )
+        if image_filename is not None:
+            create_auction.image_filename = image_filename
+        if bin_price is not None:
+            create_auction.bin_price = bin_price
+        msg = websocket_api.ClientMessage(create_auction=create_auction)
+        response = self.request(msg)
+        _, message = betterproto.which_one_of(response, "message")
+        assert isinstance(message, websocket_api.Auction)
+        return message
+
+    def settle_auction(
+        self,
+        auction_id: int,
+        buyer_id: int,
+        settle_price: float,
+    ) -> websocket_api.AuctionSettled:
+        """
+        Settle an auction (admin only).
+        """
+        msg = websocket_api.ClientMessage(
+            settle_auction=websocket_api.SettleAuction(
+                auction_id=auction_id,
+                buyer_id=buyer_id,
+                settle_price=settle_price,
+            ),
+        )
+        response = self.request(msg)
+        _, message = betterproto.which_one_of(response, "message")
+        assert isinstance(message, websocket_api.AuctionSettled)
+        return message
+
+    def delete_auction(self, auction_id: int) -> websocket_api.AuctionDeleted:
+        """
+        Delete an auction (admin only).
+        """
+        msg = websocket_api.ClientMessage(
+            delete_auction=websocket_api.DeleteAuction(auction_id=auction_id),
+        )
+        response = self.request(msg)
+        _, message = betterproto.which_one_of(response, "message")
+        assert isinstance(message, websocket_api.AuctionDeleted)
+        return message
+
+    def buy_auction(self, auction_id: int) -> websocket_api.AuctionSettled:
+        """
+        Buy an auction at its bin price.
+        """
+        msg = websocket_api.ClientMessage(
+            buy_auction=websocket_api.BuyAuction(
+                auction_id=auction_id,
+            ),
+        )
+        response = self.request(msg)
+        _, message = betterproto.which_one_of(response, "message")
+        assert isinstance(message, websocket_api.AuctionSettled)
+        return message
+
+    def edit_auction(
+        self,
+        auction_id: int,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        image_filename: Optional[str] = None,
+        bin_price: Optional[float] = None,
+    ) -> websocket_api.Auction:
+        """
+        Edit auction properties (admin only).
+        Only provided fields will be updated.
+        """
+        edit_auction = websocket_api.EditAuction(id=auction_id)
+        if name is not None:
+            edit_auction.name = name
+        if description is not None:
+            edit_auction.description = description
+        if image_filename is not None:
+            edit_auction.image_filename = image_filename
+        if bin_price is not None:
+            edit_auction.bin_price = bin_price
+        msg = websocket_api.ClientMessage(edit_auction=edit_auction)
+        response = self.request(msg)
+        _, message = betterproto.which_one_of(response, "message")
+        assert isinstance(message, websocket_api.Auction)
+        return message
+
+    def set_market_status(
+        self,
+        market_id: int,
+        status: websocket_api.MarketStatus,
+    ) -> websocket_api.Market:
+        """
+        Set the status of a market (admin only).
+        Status can be MARKET_STATUS_OPEN, MARKET_STATUS_SEMI_PAUSED, or MARKET_STATUS_PAUSED.
+        """
+        msg = websocket_api.ClientMessage(
+            edit_market=websocket_api.EditMarket(id=market_id, status=status),
+        )
+        response = self.request(msg)
+        _, message = betterproto.which_one_of(response, "message")
+        assert isinstance(message, websocket_api.Market)
+        return message
+
+    def rename_market(self, market_id: int, name: str) -> websocket_api.Market:
+        """
+        Rename a market.
+        """
+        return self.edit_market(market_id, name=name)
+
+    def set_market_description(
+        self, market_id: int, description: str
+    ) -> websocket_api.Market:
+        """
+        Set the description of a market.
+        """
+        return self.edit_market(market_id, description=description)
+
+    def pin_market(self, market_id: int) -> websocket_api.Market:
+        """
+        Pin a market.
+        """
+        return self.edit_market(market_id, pinned=True)
+
+    def unpin_market(self, market_id: int) -> websocket_api.Market:
+        """
+        Unpin a market.
+        """
+        return self.edit_market(market_id, pinned=False)
+
+    def set_market_visibility(
+        self, market_id: int, visible_to: List[int]
+    ) -> websocket_api.Market:
+        """
+        Set which accounts can see the market.
+        Pass an empty list to make the market visible to everyone.
+        """
+        return self.edit_market(market_id, visible_to=visible_to)
+
+    def set_market_redeemable(
+        self,
+        market_id: int,
+        redeemable_for: List[websocket_api.Redeemable],
+        redeem_fee: float = 0.0,
+    ) -> websocket_api.Market:
+        """
+        Set the redeemable settings for a market.
+        """
+        return self.edit_market(
+            market_id,
+            redeemable_for=redeemable_for,
+            redeem_fee=redeem_fee,
+        )
+
+    def set_market_hide_account_ids(
+        self, market_id: int, hide_account_ids: bool
+    ) -> websocket_api.Market:
+        """
+        Set whether account IDs are hidden in the market's order book and trades.
+        """
+        return self.edit_market(market_id, hide_account_ids=hide_account_ids)
+
+    def pause_market(self, market_id: int) -> websocket_api.Market:
+        """
+        Pause a market (no trading allowed).
+        """
+        return self.set_market_status(market_id, websocket_api.MarketStatus.MARKET_STATUS_PAUSED)
+
+    def unpause_market(self, market_id: int) -> websocket_api.Market:
+        """
+        Unpause a market (resume normal trading).
+        """
+        return self.set_market_status(market_id, websocket_api.MarketStatus.MARKET_STATUS_OPEN)
+
+    def semi_pause_market(self, market_id: int) -> websocket_api.Market:
+        """
+        Semi-pause a market (limited trading).
+        """
+        return self.set_market_status(market_id, websocket_api.MarketStatus.MARKET_STATUS_SEMI_PAUSED)
+
+    def edit_market(
+        self,
+        market_id: int,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        pinned: Optional[bool] = None,
+        status: Optional[websocket_api.MarketStatus] = None,
+        hide_account_ids: Optional[bool] = None,
+        visible_to: Optional[List[int]] = None,
+        redeemable_for: Optional[List[websocket_api.Redeemable]] = None,
+        redeem_fee: Optional[float] = None,
+    ) -> websocket_api.Market:
+        """
+        Edit market properties (admin only).
+        Only provided fields will be updated.
+        Note: redeemable_for and redeem_fee must both be provided together to update redeemable settings.
+        """
+        edit_market = websocket_api.EditMarket(id=market_id)
+        if name is not None:
+            edit_market.name = name
+        if description is not None:
+            edit_market.description = description
+        if pinned is not None:
+            edit_market.pinned = pinned
+        if status is not None:
+            edit_market.status = status
+        if hide_account_ids is not None:
+            edit_market.hide_account_ids = hide_account_ids
+        if visible_to is not None:
+            edit_market.update_visible_to = True
+            edit_market.visible_to = visible_to
+        if redeemable_for is not None or redeem_fee is not None:
+            edit_market.redeemable_settings = websocket_api.RedeemableSettings(
+                redeemable_for=redeemable_for if redeemable_for is not None else [],
+                redeem_fee=redeem_fee if redeem_fee is not None else 0.0,
+            )
+        msg = websocket_api.ClientMessage(edit_market=edit_market)
+        response = self.request(msg)
+        _, message = betterproto.which_one_of(response, "message")
+        assert isinstance(message, websocket_api.Market)
+        return message
+
+    def wait_portfolio_update(self, acting_as_only: bool = False):
+        while True:
+            msg = self.recv()
+            _, msg = betterproto.which_one_of(msg, "message")
+            if isinstance(msg, websocket_api.Portfolio):
+                is_acting_as = msg.account_id == self._state.acting_as
+                if not acting_as_only or is_acting_as:
+                    break
 
     def request(
         self, message: websocket_api.ClientMessage
@@ -293,7 +856,18 @@ class TradingClient:
     def close(self, code: int = CloseCode.NORMAL_CLOSURE, reason: str = ""):
         """
         Close the connection to the server.
+
+        Drains any pending messages before closing to ensure a clean
+        WebSocket close handshake.
         """
+        # Drain any pending messages to ensure clean close handshake
+        while True:
+            try:
+                self.recv(timeout=0.01)
+            except TimeoutError:
+                break
+            except Exception:
+                break  # Connection already closed or other error
         self._ws.close(code, reason)
 
     def recv(self, timeout: Optional[float] = None) -> websocket_api.ServerMessage:
@@ -326,8 +900,10 @@ class TradingClient:
 @dataclass
 class MarketData:
     definition: websocket_api.Market = field(default_factory=websocket_api.Market)
-    orders: List[websocket_api.Order] = field(default_factory=list)
     trades: List[websocket_api.Trade] = field(default_factory=list)
+    orders: List[websocket_api.Order] = field(default_factory=list)
+    bids: List[websocket_api.Order] = field(default_factory=list)
+    offers: List[websocket_api.Order] = field(default_factory=list)
     hasFullOrderHistory: bool = False
     hasFullTradeHistory: bool = False
 
@@ -341,31 +917,37 @@ class State:
     _initializing: bool = True
     user_id: int = 0
     acting_as: int = 0
+    is_admin: bool = False
+    is_cohort_member: bool = False
+    auction_enabled: bool = False
+    current_universe_id: int = 0
+    sudo_enabled: bool = False
     portfolio: websocket_api.Portfolio = field(default_factory=websocket_api.Portfolio)
     portfolios: Dict[int, websocket_api.Portfolio] = field(default_factory=dict)
     transfers: List[websocket_api.Transfer] = field(default_factory=list)
     accounts: List[websocket_api.Account] = field(default_factory=list)
     markets: Dict[int, MarketData] = field(default_factory=dict)
     market_name_to_id: Dict[str, int] = field(default_factory=dict)
-    transactions: Dict[int, datetime] = field(default_factory=dict)
+    market_types: Dict[int, websocket_api.MarketType] = field(default_factory=dict)
+    market_groups: Dict[int, websocket_api.MarketGroup] = field(default_factory=dict)
+    universes: Dict[int, websocket_api.Universe] = field(default_factory=dict)
+    auctions: Dict[int, websocket_api.Auction] = field(default_factory=dict)
 
     def _update(self, server_message: websocket_api.ServerMessage):
         kind, message = betterproto.which_one_of(server_message, "message")
 
         if isinstance(message, websocket_api.Authenticated):
             self.user_id = message.account_id
+            self.is_admin = message.is_admin
+            self.is_cohort_member = message.is_cohort_member
+            self.auction_enabled = message.auction_enabled
 
         elif isinstance(message, websocket_api.ActingAs):
             # ActingAs is always the last message in the initialization sequence
             self.acting_as = message.account_id
+            self.current_universe_id = message.universe_id
             self.portfolio = self.portfolios[self.acting_as]
             self._initializing = False
-
-        elif isinstance(message, websocket_api.Transactions):
-            self.transactions = {
-                transaction.id: transaction.timestamp
-                for transaction in message.transactions
-            }
 
         elif isinstance(message, websocket_api.Portfolios):
             if message.are_new_ownerships:
@@ -388,7 +970,6 @@ class State:
 
         elif isinstance(message, websocket_api.Transfer):
             assert kind == "transfer_created"
-            self.transactions[message.transaction.id] = message.transaction.timestamp
             if all(transfer.id != message.id for transfer in self.transfers):
                 self.transfers.append(message)
 
@@ -401,14 +982,24 @@ class State:
                 self.accounts.append(message)
 
         elif isinstance(message, websocket_api.Market):
-            self.transactions[message.transaction.id] = message.transaction.timestamp
-
             self.markets.setdefault(message.id, MarketData()).definition = message
             self.market_name_to_id[message.name] = message.id
 
         elif isinstance(message, websocket_api.Orders):
             market_data = self.markets.setdefault(message.market_id, MarketData())
             market_data.orders = message.orders
+            market_data.bids = [
+                order
+                for order in message.orders
+                if order.side == websocket_api.Side.BID
+            ]
+            market_data.bids.sort(key=lambda x: x.price, reverse=True)
+            market_data.offers = [
+                order
+                for order in message.orders
+                if order.side == websocket_api.Side.OFFER
+            ]
+            market_data.offers.sort(key=lambda x: x.price)
             market_data.hasFullOrderHistory = message.has_full_history
 
         elif isinstance(message, websocket_api.Trades):
@@ -417,37 +1008,52 @@ class State:
             market_data.hasFullTradeHistory = message.has_full_history
 
         elif isinstance(message, websocket_api.MarketSettled):
-            self.transactions[message.transaction.id] = message.transaction.timestamp
-
             self.markets[message.id].definition.closed = websocket_api.MarketClosed(
-                settle_price=message.settle_price, transaction_id=message.transaction.id
+                settle_price=message.settle_price,
+                transaction_id=message.transaction_id,
+                transaction_timestamp=message.transaction_timestamp,
             )
 
         elif isinstance(message, websocket_api.OrdersCancelled):
-            self.transactions[message.transaction.id] = message.transaction.timestamp
-
             if self.markets[message.market_id].hasFullOrderHistory:
+                # Updating in place means we don't need to touch bids or offers
                 for order in self.markets[message.market_id].orders:
                     if order.id in message.order_ids:
                         order.size = 0
                         order.sizes.append(
                             websocket_api.Size(
-                                transaction_id=message.transaction.id, size=0
+                                size=0,
+                                transaction_id=message.transaction_id,
+                                transaction_timestamp=message.transaction_timestamp,
                             )
                         )
             else:
-                self.markets[message.market_id].orders = [
-                    order
-                    for order in self.markets[message.market_id].orders
-                    if order.id not in message.order_ids
-                ]
+                remove_orders_in_place(
+                    self.markets[message.market_id].orders, message.order_ids
+                )
+                remove_orders_in_place(
+                    self.markets[message.market_id].bids, message.order_ids
+                )
+                remove_orders_in_place(
+                    self.markets[message.market_id].offers, message.order_ids
+                )
 
         elif isinstance(message, websocket_api.OrderCreated):
-            self.transactions[message.transaction.id] = message.transaction.timestamp
-
             orders = self.markets[message.market_id].orders
             if message.order.id:
                 orders.append(message.order)
+                if message.order.side == websocket_api.Side.BID:
+                    bisect.insort(
+                        self.markets[message.market_id].bids,
+                        message.order,
+                        key=lambda x: -x.price,
+                    )
+                else:
+                    bisect.insort(
+                        self.markets[message.market_id].offers,
+                        message.order,
+                        key=lambda x: x.price,
+                    )
             if message.fills:
                 if self.markets[message.market_id].hasFullOrderHistory:
                     for order in orders:
@@ -458,18 +1064,13 @@ class State:
                             order.size = fill.size_remaining
                             order.sizes.append(
                                 websocket_api.Size(
-                                    transaction_id=message.transaction.id,
                                     size=fill.size_remaining,
+                                    transaction_id=message.transaction_id,
+                                    transaction_timestamp=message.transaction_timestamp,
                                 )
                             )
 
                 else:
-                    fully_filled_orders = [
-                        fill.id for fill in message.fills if fill.size_remaining == 0
-                    ]
-                    orders = [
-                        order for order in orders if order.id not in fully_filled_orders
-                    ]
                     partial_fills = [
                         fill for fill in message.fills if fill.size_remaining > 0
                     ]
@@ -480,9 +1081,67 @@ class State:
                         ):
                             order.size = fill.size_remaining
 
-                self.markets[message.market_id].orders = orders
+                    full_fills = [
+                        fill.id for fill in message.fills if fill.size_remaining == 0
+                    ]
+                    remove_orders_in_place(
+                        self.markets[message.market_id].orders, full_fills
+                    )
+                    remove_orders_in_place(
+                        self.markets[message.market_id].bids, full_fills
+                    )
+                    remove_orders_in_place(
+                        self.markets[message.market_id].offers, full_fills
+                    )
             if message.trades:
                 self.markets[message.market_id].trades.extend(message.trades)
+
+        elif isinstance(message, websocket_api.MarketTypes):
+            self.market_types = {mt.id: mt for mt in message.market_types}
+
+        elif isinstance(message, websocket_api.MarketType):
+            self.market_types[message.id] = message
+
+        elif isinstance(message, websocket_api.MarketTypeDeleted):
+            self.market_types.pop(message.market_type_id, None)
+
+        elif isinstance(message, websocket_api.MarketGroups):
+            self.market_groups = {mg.id: mg for mg in message.market_groups}
+
+        elif isinstance(message, websocket_api.MarketGroup):
+            self.market_groups[message.id] = message
+
+        elif isinstance(message, websocket_api.SudoStatus):
+            self.sudo_enabled = message.enabled
+
+        elif isinstance(message, websocket_api.Universes):
+            self.universes = {u.id: u for u in message.universes}
+
+        elif isinstance(message, websocket_api.Universe):
+            self.universes[message.id] = message
+
+        elif isinstance(message, websocket_api.Auction):
+            self.auctions[message.id] = message
+
+        elif isinstance(message, websocket_api.AuctionSettled):
+            if message.id in self.auctions:
+                self.auctions[message.id].closed = websocket_api.AuctionClosed(
+                    settle_price=message.settle_price,
+                )
+                self.auctions[message.id].buyer_id = message.buyer_id
+
+        elif isinstance(message, websocket_api.AuctionDeleted):
+            self.auctions.pop(message.auction_id, None)
+
+
+def remove_orders_in_place(orders: List[websocket_api.Order], order_ids: List[int]):
+    removed = 0
+    for i in range(len(orders) - 1, -1, -1):
+        if removed == len(order_ids):
+            break
+        if orders[i].id in order_ids:
+            del orders[i]
+            removed += 1
 
 
 class RequestFailed(Exception):

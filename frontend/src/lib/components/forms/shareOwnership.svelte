@@ -1,12 +1,18 @@
 <script lang="ts">
-	import { accountName, sendClientMessage, serverState } from '$lib/api.svelte';
+	import {
+		accountName,
+		disambiguatedAccountNames,
+		sendClientMessage,
+		serverState
+	} from '$lib/api.svelte';
+	import { universeMode } from '$lib/universeMode.svelte';
 	import { buttonVariants } from '$lib/components/ui/button';
 	import * as Command from '$lib/components/ui/command';
 	import * as Form from '$lib/components/ui/form';
 	import * as Popover from '$lib/components/ui/popover';
 	import { cn } from '$lib/utils';
-	import Check from 'lucide-svelte/icons/check';
-	import ChevronsUpDown from 'lucide-svelte/icons/chevrons-up-down';
+	import Check from '@lucide/svelte/icons/check';
+	import ChevronsUpDown from '@lucide/svelte/icons/chevrons-up-down';
 	import { websocket_api } from 'schema-js';
 	import { tick } from 'svelte';
 	import { protoSuperForm } from './protoSuperForm';
@@ -41,32 +47,39 @@
 		});
 	}
 
-	let canShare = $derived(
-		Array.from(
-			serverState.portfolios
-				.values()
-				.filter((p) =>
-					p.ownerCredits?.find(({ ownerId }) => serverState.accounts.get(ownerId)?.isUser)
-				)
-				.map(({ accountId }) => accountId)
-		)
-	);
+	let canShare = $derived.by(() => {
+		const baseIds = [...serverState.portfolios.values()]
+			.filter((p) =>
+				p.ownerCredits?.find(({ ownerId }) => serverState.accounts.get(ownerId)?.isUser)
+			)
+			.map(({ accountId }) => accountId);
+
+		// When universe mode is enabled, filter to current universe
+		if (universeMode.enabled) {
+			return baseIds.filter((id) => {
+				const account = serverState.accounts.get(id);
+				return account?.universeId === serverState.currentUniverseId;
+			});
+		}
+		return baseIds;
+	});
 	let canShareWith = $derived.by(() => {
 		// This might not be serverState.userId if you're an admin
-		const currentUser = serverState.portfolios
-			.values()
-			.find((p) => !p.ownerCredits?.length)?.accountId;
-		return Array.from(
-			serverState.accounts
-				.values()
-				.filter((a) => a.isUser && a.id !== currentUser)
-				.map(({ id }) => id)
-		);
+		const currentUser = [...serverState.portfolios.values()].find(
+			(p) => !p.ownerCredits?.length
+		)?.accountId;
+		// Don't filter by universe - users (with kinde_id) are in universe 0,
+		// but we want to be able to share non-zero universe accounts with them
+		return [...serverState.accounts.values()]
+			.filter((a) => a.isUser && a.id !== currentUser)
+			.map(({ id }) => id);
 	});
+
+	let shareDisplayNames = $derived(disambiguatedAccountNames(canShare));
+	let shareWithDisplayNames = $derived(disambiguatedAccountNames(canShareWith));
 </script>
 
-<form use:enhance class="flex gap-4">
-	<Form.Button class="w-32">Share Ownership</Form.Button>
+<form use:enhance class="flex flex-col gap-4 md:flex-row">
 	<Form.Field {form} name="ofAccountId">
 		<Popover.Root bind:open={firstPopoverOpen}>
 			<Form.Control>
@@ -81,7 +94,9 @@
 						{...props}
 						bind:ref={firstTriggerRef}
 					>
-						{$formData.ofAccountId ? accountName($formData.ofAccountId) : 'Select account to share'}
+						{$formData.ofAccountId
+							? (shareDisplayNames.get($formData.ofAccountId) ?? accountName($formData.ofAccountId))
+							: 'Select account to share'}
 						<ChevronsUpDown class="ml-2 h-4 w-4 shrink-0 opacity-50" />
 					</Popover.Trigger>
 					<input hidden value={$formData.ofAccountId} name={props.name} />
@@ -90,26 +105,28 @@
 			<Popover.Content class="w-56 p-0">
 				<Command.Root>
 					<Command.Input autofocus placeholder="Search accounts..." class="h-9" />
-					<Command.Empty>No owned accounts</Command.Empty>
-					<Command.Group>
-						{#each canShare as ofAccountId (ofAccountId)}
-							<Command.Item
-								value={accountName(ofAccountId)}
-								onSelect={() => {
-									$formData.ofAccountId = ofAccountId;
-									closePopoverAndFocusTrigger(firstTriggerRef);
-								}}
-							>
-								{accountName(ofAccountId)}
-								<Check
-									class={cn(
-										'ml-auto h-4 w-4',
-										ofAccountId !== $formData.ofAccountId && 'text-transparent'
-									)}
-								/>
-							</Command.Item>
-						{/each}
-					</Command.Group>
+					<Command.List>
+						<Command.Empty>No owned accounts</Command.Empty>
+						<Command.Group>
+							{#each canShare as ofAccountId (ofAccountId)}
+								<Command.Item
+									value={shareDisplayNames.get(ofAccountId)}
+									onSelect={() => {
+										$formData.ofAccountId = ofAccountId;
+										closePopoverAndFocusTrigger(firstTriggerRef);
+									}}
+								>
+									{shareDisplayNames.get(ofAccountId)}
+									<Check
+										class={cn(
+											'ml-auto h-4 w-4',
+											ofAccountId !== $formData.ofAccountId && 'text-transparent'
+										)}
+									/>
+								</Command.Item>
+							{/each}
+						</Command.Group>
+					</Command.List>
 				</Command.Root>
 			</Popover.Content>
 		</Popover.Root>
@@ -130,7 +147,8 @@
 						bind:ref={secondTriggerRef}
 					>
 						{$formData.toAccountId
-							? accountName($formData.toAccountId, 'Yourself')
+							? (shareWithDisplayNames.get($formData.toAccountId) ??
+								accountName($formData.toAccountId))
 							: 'Select new owner'}
 						<ChevronsUpDown class="ml-2 h-4 w-4 shrink-0 opacity-50" />
 					</Popover.Trigger>
@@ -140,26 +158,32 @@
 			<Popover.Content class="w-56 p-0">
 				<Command.Root>
 					<Command.Input autofocus placeholder="Search users..." class="h-9" />
-					<Command.Empty>No users found</Command.Empty>
-					<Command.Group>
-						{#each canShareWith as id (id)}
-							<Command.Item
-								value={accountName(id, 'Yourself')}
-								onSelect={() => {
-									$formData.toAccountId = id;
-									closePopoverAndFocusTrigger(secondTriggerRef);
-								}}
-							>
-								{accountName(id, 'Yourself')}
-								<Check
-									class={cn('ml-auto h-4 w-4', id !== $formData.toAccountId && 'text-transparent')}
-								/>
-							</Command.Item>
-						{/each}
-					</Command.Group>
+					<Command.List>
+						<Command.Empty>No users found</Command.Empty>
+						<Command.Group>
+							{#each canShareWith as id (id)}
+								<Command.Item
+									value={shareWithDisplayNames.get(id)}
+									onSelect={() => {
+										$formData.toAccountId = id;
+										closePopoverAndFocusTrigger(secondTriggerRef);
+									}}
+								>
+									{shareWithDisplayNames.get(id)}
+									<Check
+										class={cn(
+											'ml-auto h-4 w-4',
+											id !== $formData.toAccountId && 'text-transparent'
+										)}
+									/>
+								</Command.Item>
+							{/each}
+						</Command.Group>
+					</Command.List>
 				</Command.Root>
 			</Popover.Content>
 		</Popover.Root>
 		<Form.FieldErrors />
 	</Form.Field>
+	<Form.Button class="w-32">Submit</Form.Button>
 </form>
